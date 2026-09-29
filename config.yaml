@@ -1,0 +1,208 @@
+# ═══════════════════════════════════════════════════════════════════════
+#  Настройки голосового ассистента «Джарвис»
+#  Файл в кодировке UTF-8. После ручного изменения перезапустите программу.
+#  Ключи API храните в файле .env (образец — .env.example), а не здесь.
+# ═══════════════════════════════════════════════════════════════════════
+
+# ─── Языковая модель ────────────────────────────────────────────────────
+llm:
+  # Бэкенд при запуске: ollama | gigachat | gemini
+  # (переключается и в окне; выбор в окне сохраняется сюда же)
+  backend: ollama
+  # Максимум обращений к модели на один запрос (агентский цикл)
+  max_steps: 5
+  # Сколько последних сообщений диалога отправлять модели
+  history_messages: 20
+  # Сколько секунд ждать ответа модели (на ПК без видеокарты первый ответ
+  # локальной модели может готовиться пару минут)
+  timeout: 300
+
+ollama:
+  host: http://localhost:11434
+  model: qwen3:8b
+  # false — отключить «размышления» (думающий режим qwen3): ответы намного быстрее
+  think: false
+  temperature: 0.4
+  # Сколько держать модель в памяти после запроса
+  keep_alive: 30m
+  # Размер контекста в токенах (описания инструментов занимают ~3 тыс.)
+  num_ctx: 8192
+  # Загрузить модель в память сразу при запуске, чтобы первый ответ был быстрым
+  preload: true
+
+gigachat:
+  # Бесплатные модели Freemium для физлиц (годовые лимиты токенов):
+  #   GigaChat-2 (Lite, 250 млн) · GigaChat-2-Pro (40 млн)
+  #   GigaChat-2-Max (25 млн)    · GigaChat-3-Ultra (50 млн)
+  # Pro/Max/Ultra лучше справляются с инструментами, Lite — быстрее и с большим лимитом.
+  model: GigaChat-2
+  scope: GIGACHAT_API_PERS   # для физических лиц
+  temperature: 0.4
+  # Корневой сертификат НУЦ Минцифры (скачивается download_models.py).
+  # Если файла нет — используется хранилище сертификатов Windows.
+  ca_bundle_file: certs/russian_trusted_root_ca.crt
+  # Проверка сертификатов. false — небезопасно, только если ничего не помогло
+  verify_ssl_certs: true
+
+gemini:
+  # Бесплатные модели Google AI Studio (нужен ключ GEMINI_API_KEY в .env):
+  #   gemini-flash-latest      — последняя Flash (умнее)
+  #   gemini-flash-lite-latest — быстрее, выше лимит запросов в день
+  #   или конкретная версия, например gemini-3.5-flash
+  model: gemini-flash-latest
+  # Глубина размышлений: minimal | low | medium | high | "" (по умолчанию модели).
+  # Если модель не поддерживает значение, настройка отключится автоматически.
+  thinking_level: low
+  # null — температура по умолчанию модели (Google рекомендует так для Gemini 3)
+  temperature: null
+  # Прокси, если Gemini недоступен в вашем регионе, например
+  # http://127.0.0.1:10809 или socks5://127.0.0.1:10808. Пусто — прямое подключение.
+  proxy: ""
+
+# ─── Системный промпт ───────────────────────────────────────────────────
+system_prompt: |
+  Ты — Джарвис, ИИ-ассистент, управляющий компьютером пользователя. Отвечай по-русски, коротко, обращайся “сэр”, лёгкая британская ирония. Для действий с ПК используй инструменты; не говори, что действие выполнено, если не вызвал инструмент.
+  Ответ будет озвучен, поэтому пиши обычным текстом: без markdown, списков и эмодзи.
+  Если инструмент вернул ошибку или пользователь отменил действие — честно скажи об этом.
+
+# ─── Голос ──────────────────────────────────────────────────────────────
+voice:
+  # Папка с моделью Vosk (скачивается download_models.py)
+  vosk_model_path: models/vosk-model-small-ru-0.22
+  # Микрофон: null — по умолчанию; можно номер устройства или часть названия
+  input_device: null
+  # Режим «Джарвис» при запуске: постоянно слушать и реагировать на фразы,
+  # начинающиеся со слова-активатора
+  jarvis_mode: false
+  # Озвучивать ответы
+  speak_replies: true
+  # Слово-активатор и его частые варианты распознавания
+  wake_words: [джарвис, джервис, жарвис, джарвиз]
+  # Слова, прерывающие речь и генерацию
+  stop_words: [стоп, хватит, замолчи, замолкни, остановись, довольно]
+  # Сколько секунд ждать начала фразы после кнопки «Микрофон» / Ctrl+Alt+J
+  listen_timeout: 7
+  # Максимальная длина одной фразы, секунд
+  max_phrase_seconds: 15
+  # Если сказали только «Джарвис» — сколько секунд ждать саму команду
+  follow_up_seconds: 6
+  # Короткий звуковой сигнал в начале прослушивания
+  earcons: true
+
+tts:
+  speaker: aidar           # голоса Silero v4: aidar, baya, kseniya, xenia, eugene
+  sample_rate: 48000       # 8000 | 24000 | 48000
+  model_path: models/silero/v4_ru.pt
+  model_url: https://models.silero.ai/models/tts/ru/v4_ru.pt
+  threads: 4               # потоков процессора для синтеза
+  max_chunk_chars: 800     # максимум символов в одном куске синтеза
+  volume: 1.0              # громкость голоса, 0.1–2.0
+  output_device: null      # null — динамики по умолчанию
+
+# Глобальная горячая клавиша «начать слушать» (работает и при свёрнутом окне)
+hotkey: ctrl+alt+j
+
+# ─── Инструменты управления ПК ──────────────────────────────────────────
+tools:
+  # Сколько секунд ждать подтверждения опасного действия (потом — отмена)
+  confirm_timeout: 20
+  # Разрешить инструмент run_powershell (всегда только с подтверждением)
+  allow_powershell: false
+  powershell_timeout: 30
+  # Задержка перед выключением/перезагрузкой, секунд (можно успеть отменить)
+  shutdown_delay: 10
+  # Поисковик для web_search. Яндекс: https://yandex.ru/search/?text={query}
+  search_url: "https://www.google.com/search?q={query}"
+
+  # Алиасы приложений для open_app / close_app.
+  # Ключ — названия через запятую. Значение — что запускать: строка или список
+  # вариантов (пробуются по очереди), либо {run: ..., process: ...}, где process —
+  # имена процессов для close_app. Варианты запуска:
+  #   notepad.exe              — программа из PATH или реестра «App Paths»
+  #   '%APPDATA%\Папка\X.exe'  — полный путь (переменные окружения раскрываются)
+  #   '"C:\Путь\X.exe" --арг'  — путь в кавычках и аргументы
+  #   'ms-settings:', 'tg://'  — URI-протокол установленного приложения
+  #   https://...              — сайт
+  #   'start:Имя'              — ярлык из меню «Пуск» (или приложение Microsoft Store)
+  #   '@browser'               — браузер по умолчанию
+  # Если приложения нет в списке, Джарвис сам поищет его в меню «Пуск».
+  apps:
+    "браузер, browser, интернет": '@browser'
+    "блокнот, notepad":
+      run: notepad.exe
+      process: notepad.exe
+    "калькулятор, calculator, calc":
+      run: calc.exe
+      process: [CalculatorApp.exe, Calculator.exe, calc.exe]
+    "проводник, explorer, file explorer":
+      run: explorer.exe
+      process: explorer.exe
+    "телеграм, телеграмм, telegram, тг":
+      run: ['%APPDATA%\Telegram Desktop\Telegram.exe', 'tg://', 'start:Telegram']
+      process: Telegram.exe
+    "хром, гугл хром, chrome, google chrome":
+      run: [chrome.exe, 'start:Google Chrome']
+      process: chrome.exe
+    "эдж, edge, microsoft edge":
+      run: ['microsoft-edge:', msedge.exe]
+      process: msedge.exe
+    "файрфокс, фаерфокс, firefox, mozilla":
+      run: [firefox.exe, 'start:Firefox']
+      process: firefox.exe
+    "яндекс браузер, yandex browser":
+      run: ['%LOCALAPPDATA%\Yandex\YandexBrowser\Application\browser.exe', 'start:Yandex']
+      process: browser.exe
+    "дискорд, discord":
+      run: ['start:Discord', 'discord://']
+      process: Discord.exe
+    "стим, steam":
+      run: ['steam://open/main', 'start:Steam']
+      process: steam.exe
+    "спотифай, spotify":
+      run: ['spotify:', 'start:Spotify']
+      process: Spotify.exe
+    "ватсап, вотсап, whatsapp":
+      run: ['whatsapp:', 'start:WhatsApp']
+      process: WhatsApp.exe
+    "зум, zoom":
+      run: 'start:Zoom'
+      process: Zoom.exe
+    "ворд, word, microsoft word":
+      run: [winword.exe, 'start:Word']
+      process: WINWORD.EXE
+    "эксель, excel, microsoft excel":
+      run: [excel.exe, 'start:Excel']
+      process: EXCEL.EXE
+    "пауэрпоинт, powerpoint":
+      run: [powerpnt.exe, 'start:PowerPoint']
+      process: POWERPNT.EXE
+    "вс код, visual studio code, vs code, vscode":
+      run: ['%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe', 'start:Visual Studio Code']
+      process: Code.exe
+    "пейнт, паинт, paint":
+      run: mspaint.exe
+      process: mspaint.exe
+    "диспетчер задач, task manager":
+      run: taskmgr.exe
+      process: Taskmgr.exe
+    "параметры, настройки, settings":
+      run: 'ms-settings:'
+      process: SystemSettings.exe
+    "панель управления, control panel": control.exe
+    "командная строка, консоль, cmd":
+      run: cmd.exe
+      process: cmd.exe
+    "powershell, пауэршелл":
+      run: powershell.exe
+      process: powershell.exe
+    "терминал, terminal, windows terminal":
+      run: [wt.exe, 'start:Terminal']
+      process: WindowsTerminal.exe
+    "obs, обс":
+      run: 'start:OBS Studio'
+      process: obs64.exe
+    "vlc, влс":
+      run: [vlc.exe, 'start:VLC']
+      process: vlc.exe
+    "ютуб, youtube": https://www.youtube.com
+    "вконтакте, вк, vk": https://vk.com

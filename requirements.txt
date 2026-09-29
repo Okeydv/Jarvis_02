@@ -1,0 +1,30 @@
+# Джарвис — зависимости (Windows 10/11, Python 3.10+)
+# PyTorch лучше ставить CPU-сборкой (так делает install.bat):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Интерфейс
+customtkinter>=5.2.2
+
+# Языковые модели
+ollama>=0.5.1
+gigachat>=0.2.0
+google-genai>=1.30.0
+httpx[socks]>=0.27
+
+# Голос
+vosk>=0.3.45
+sounddevice>=0.4.6
+numpy>=1.24
+torch>=2.1
+num2words>=0.5.13
+
+# Управление компьютером
+psutil>=5.9
+pycaw>=20240316
+comtypes>=1.2
+pyautogui>=0.9.54
+Pillow>=10.0
+
+# Прочее
+python-dotenv>=1.0
+PyYAML>=6.0

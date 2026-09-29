@@ -1,0 +1,17 @@
+# Секреты
+.env
+
+# Окружение и кэши
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Скачиваемые модели и сертификаты (download_models.py)
+models/
+certs/
+
+# Логи
+logs/
