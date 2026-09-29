@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import threading
 import time
 from typing import Callable
+
+from . import winapi
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +22,21 @@ class VoiceError(Exception):
         super().__init__(message)
         self.message = message
         self.hint = hint
+
+
+def _load_vosk_model(vosk, path):
+    """Vosk (Kaldi) в Windows не открывает пути с кириллицей, например C:\\Users\\Иван\\…
+    Тогда берём короткий путь 8.3, а если его нет — грузим модель по относительному
+    пути из её родительской папки."""
+    text = winapi.short_path(str(path))
+    if text.isascii() or not winapi.IS_WINDOWS or not path.name.isascii():
+        return vosk.Model(text)
+    previous = os.getcwd()
+    os.chdir(path.parent)
+    try:
+        return vosk.Model(path.name)
+    finally:
+        os.chdir(previous)
 
 
 class Listener:
@@ -71,10 +89,13 @@ class Listener:
             raise VoiceError(f"Не удалось загрузить аудиобиблиотеку: {exc}") from None
         vosk.SetLogLevel(-1)
         try:
-            self._model = vosk.Model(str(path))
+            self._model = _load_vosk_model(vosk, path)
         except Exception as exc:
-            raise VoiceError(f"Не удалось загрузить модель Vosk из {path}: {exc}",
-                             "Скачайте модель заново: python download_models.py --vosk") from None
+            hint = "Скачайте модель заново: python download_models.py --vosk"
+            if not str(path).isascii():
+                hint = ("Vosk не понимает русские буквы в пути к модели. Перенесите папку с моделью в путь "
+                        "без кириллицы (например C:\\Jarvis\\models) и укажите его в voice.vosk_model_path.")
+            raise VoiceError(f"Не удалось загрузить модель Vosk из {path}: {exc}", hint) from None
         self._input_device()  # проверка микрофона
         self.available = True
         self._thread = threading.Thread(target=self._run, name="stt", daemon=True)

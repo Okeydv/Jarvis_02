@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import queue
 import threading
@@ -96,7 +97,8 @@ class Speaker:
                                   f"Скачайте вручную {url} и положите в {path} (или запустите python download_models.py).") from None
         status("Загружаю синтез речи…")
         try:
-            importer = torch.package.PackageImporter(str(path))
+            # Читаем файл средствами Python: так не мешает кириллица в пути к папке.
+            importer = torch.package.PackageImporter(io.BytesIO(path.read_bytes()))
             model = importer.load_pickle("tts_models", "model")
             model.to(torch.device("cpu"))
         except Exception as exc:

@@ -133,6 +133,19 @@ def known_folder(name: str) -> Path:
     return Path.home() / name
 
 
+def short_path(path: str) -> str:
+    """Короткий путь 8.3 (только ASCII) — для библиотек, не понимающих кириллицу в путях."""
+    if not IS_WINDOWS or path.isascii():
+        return path
+    kernel32.GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    kernel32.GetShortPathNameW.restype = wintypes.DWORD
+    size = kernel32.GetShortPathNameW(path, None, 0)
+    if not size:
+        return path
+    buffer = ctypes.create_unicode_buffer(size)
+    return buffer.value if kernel32.GetShortPathNameW(path, buffer, size) else path
+
+
 # ─── Окна и фокус ──────────────────────────────────────────────────────
 
 def foreground_window() -> int:
