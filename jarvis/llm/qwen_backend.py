@@ -15,7 +15,7 @@ import threading
 import httpx
 
 from .base import AssistantTurn, LLMBackend, LLMError, TextCallback, ToolCall
-from .ollama_backend import ThinkFilter, looks_like_tool_json, parse_text_tool_calls
+from .ollama_backend import ThinkFilter, looks_like_tool_json, parse_text_tool_calls, strip_think
 
 log = logging.getLogger(__name__)
 
@@ -269,6 +269,33 @@ class QwenBackend(LLMBackend):
                            "Выберите модель в «Настройки → Модели → Qwen»"
                            + (f". Доступны, например: {', '.join(qwen)}." if qwen else "."))
         return None
+
+    def supports_vision(self) -> bool:
+        return True  # у Qwen3.x на BazaarLink вход «текст + изображение»; иначе сервис ответит ошибкой
+
+    def vision(self, prompt: str, image: bytes, mime: str = "image/jpeg") -> str:
+        import base64
+
+        model = str(self.config.get("qwen.vision_model") or self.model)
+        content = [{"type": "text", "text": prompt},
+                   {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(image).decode()}"}}]
+        body: dict = {"model": model, "messages": [{"role": "user", "content": content}], "stream": False}
+        if self._thinking_param and "qwen" in model.lower():
+            body["enable_thinking"] = False
+        try:
+            response = self.client.post("/chat/completions", json=body)
+        except httpx.HTTPError as exc:
+            raise self._transport_error(exc) from None
+        if response.status_code >= 400:
+            raise self._status_error(response.status_code, response)
+        try:
+            message = response.json()["choices"][0]["message"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            raise LLMError("Qwen вернул непонятный ответ на изображение.") from None
+        text = message.get("content") or ""
+        if isinstance(text, list):  # некоторые сервисы отвечают списком частей
+            text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
+        return strip_think(str(text))
 
     def stream_chat(self, system: str, messages: list[dict], tools: list[dict], allow_tools: bool,
                     cancel: threading.Event, on_text: TextCallback) -> AssistantTurn:

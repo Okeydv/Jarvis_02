@@ -74,6 +74,14 @@ class LLMBackend(ABC):
     def warmup(self, system: str, tools: list[dict]) -> None:  # noqa: B027 — необязательный шаг
         """Подготовка к первому запросу (по умолчанию ничего не делает)."""
 
+    def supports_vision(self) -> bool:
+        """Умеет ли модель смотреть на изображения (снимок экрана)."""
+        return False
+
+    def vision(self, prompt: str, image: bytes, mime: str = "image/jpeg") -> str:
+        """Ответ модели про изображение (JPEG/PNG)."""
+        raise LLMError(f"{self.title}: модель не умеет смотреть на изображения.")
+
     def close(self) -> None:  # noqa: B027 — по умолчанию освобождать нечего
         """Освобождает сетевые соединения бэкенда."""
 

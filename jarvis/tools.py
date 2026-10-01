@@ -44,6 +44,7 @@ class Confirmation:
     text: str
     details: str = ""  # например, полная команда PowerShell
     data: Any = None   # подготовленные данные, которые получит инструмент
+    image: Any = None  # картинка для окна подтверждения (PIL.Image), например место клика
 
 
 @dataclass
@@ -111,6 +112,53 @@ class ToolServices:
         self.focus = focus
         self.apps = AppCatalog(config.get("tools.apps", {}) or {})
         self.timers: list[threading.Timer] = []
+        self.reminders: list[dict] = []  # {"when": datetime, "label": str} — для брифинга
+        self.registry: "ToolRegistry | None" = None
+        # Видно ли, что делают вложенные шаги (сценарии): (инструмент, аргументы, результат)
+        self.on_step: Callable[[str, dict, "ToolResult"], None] = lambda name, args, result: None
+        self.vision = None  # VisionService — подключает приложение
+        self.on_schedule_changed: Callable[[], None] = lambda: None
+        self._stores: dict[str, Any] = {}
+        self._stores_lock = threading.Lock()
+
+    # Хранилища создаются при первом обращении (папка данных зависит от настроек).
+    def _store(self, key: str, factory: Callable[[Path], Any]) -> Any:
+        with self._stores_lock:
+            if key not in self._stores:
+                from .storage import data_folder
+
+                self._stores[key] = factory(data_folder(self.config))
+            return self._stores[key]
+
+    @property
+    def memory(self):
+        from .memory import Memory
+
+        return self._store("memory", lambda folder: Memory(folder / "memory.json"))
+
+    @property
+    def routines(self):
+        from .routines import Routines
+
+        return self._store("routines", lambda folder: Routines(folder / "routines.json"))
+
+    @property
+    def schedule(self):
+        from .routines import Schedule
+
+        return self._store("schedule", lambda folder: Schedule(folder / "schedule.json"))
+
+    @property
+    def skills(self):
+        from .skills import Skills
+
+        return self._store("skills", lambda folder: Skills(folder / "Skills"))
+
+    @property
+    def backups(self):
+        from .backups import Backups
+
+        return self._store("backups", lambda folder: Backups(folder / "Backups"))
 
 
 class CallContext:
@@ -124,6 +172,7 @@ class CallContext:
 class ToolRegistry:
     def __init__(self, services: ToolServices):
         self.services = services
+        services.registry = self
 
     def available_tools(self) -> list[Tool]:
         return [t for t in TOOLS.values() if t.available is None or t.available(self.services.config)]
@@ -1204,6 +1253,7 @@ def timer(ctx: CallContext, minutes: float | None = None, at: str = "", label: s
     handle.start()
     services.timers.append(handle)
     ends = now + timedelta(seconds=seconds)
+    services.reminders.append({"when": ends, "label": label})
     if at:
         day = "" if ends.date() == now.date() else " завтра"
         return f"Напоминание «{label}» поставлено на {ends:%H:%M}{day}."
@@ -1419,11 +1469,14 @@ def write_file(ctx: CallContext, path: str, content: str, open: bool = True) -> 
         raise ToolError(f"слишком большой файл (больше {MAX_FILE_CHARS} символов)")
     target = resolve_file(path, ctx.config)
     target.parent.mkdir(parents=True, exist_ok=True)
+    backup = ctx.services.backups.backup(target, reason="write_file") if target.exists() else None
     # PowerShell 5 читает UTF-8 без BOM как ANSI — для .ps1 пишем с BOM.
     encoding = "utf-8-sig" if target.suffix.lower() == ".ps1" else "utf-8"
     target.write_text(content, encoding=encoding)
     lines = content.count("\n") + 1
     result = f"Файл сохранён: {target} ({lines} {ru_plural(lines, ('строка', 'строки', 'строк'))})."
+    if backup:
+        result += " Прежняя версия сохранена — вернуть её: restore_file."
     if open:
         try:
             result += f" Открыт в редакторе «{open_in_editor(target, ctx.config)}»."
@@ -1438,10 +1491,13 @@ def _read_text(path: Path) -> str:
         raise ToolError(f"{path.name} — двоичный файл, а не текст")
     for encoding in ("utf-8-sig", "cp1251"):
         try:
-            return data.decode(encoding)
+            text = data.decode(encoding)
+            break
         except UnicodeDecodeError:
             continue
-    return data.decode("utf-8", errors="replace")
+    else:
+        text = data.decode("utf-8", errors="replace")
+    return text.replace("\r\n", "\n")  # переводы строк Windows → обычные
 
 
 @tool(
@@ -1594,10 +1650,13 @@ def find_files(ctx: CallContext, name: str, folder: str = "") -> str:
 
 @tool(
     "clipboard",
-    "Буфер обмена: action=get — прочитать текст из буфера (например, чтобы перевести или исправить "
-    "скопированное), action=set — положить текст в буфер (пользователь вставит его Ctrl+V).",
+    "Буфер обмена и выделенный текст: action=selection — взять текст, выделенный сейчас в активном окне "
+    "(для просьб «исправь это», «переведи выделенное», «что тут написано»); action=get — прочитать буфер; "
+    "action=set — положить текст в буфер (пользователь вставит его Ctrl+V). Чтобы заменить выделенный "
+    "текст исправленным — type_text.",
     {
-        "action": {"type": "string", "enum": ["get", "set"], "description": "get — прочитать, set — записать"},
+        "action": {"type": "string", "enum": ["selection", "get", "set"],
+                   "description": "selection — выделенный текст, get — прочитать буфер, set — записать"},
         "text": {"type": "string", "description": "Текст для action=set"},
     },
     required=("action",),
@@ -1607,12 +1666,41 @@ def clipboard(ctx: CallContext, action: str, text: str = "") -> str:
     if action == "set":
         winapi.set_clipboard_text(text)
         return f"Скопировал в буфер обмена ({len(text)} символов)."
+    if action == "selection":
+        return _selected_text(ctx)
     content = winapi.get_clipboard_text()
     if not content:
         return "Буфер обмена пуст (или в нём не текст)."
     if len(content) > MAX_READ_CHARS:
         content = content[:MAX_READ_CHARS] + "\n…(обрезано)"
     return f"В буфере обмена:\n{content}"
+
+
+def _selected_text(ctx: CallContext) -> str:
+    """Копирует выделенное в активном окне (Ctrl+C) и возвращает буфер обмена в прежнее состояние."""
+    winapi._require_windows()
+    target = _wait_for_external_window(ctx)
+    if not target:
+        raise ToolError("не нашёл окно с выделенным текстом")
+    try:
+        previous = winapi.get_clipboard_text()
+    except OSError:
+        previous = ""
+    marker = f"\u2063jarvis-{time.monotonic_ns()}"  # невидимая метка: понять, что Ctrl+C сработал
+    winapi.set_clipboard_text(marker)
+    _pyautogui().hotkey("ctrl", "c", interval=0.05)
+    selected = ""
+    for _ in range(15):
+        time.sleep(0.1)
+        selected = winapi.get_clipboard_text()
+        if selected != marker:
+            break
+    winapi.set_clipboard_text(previous)
+    if not selected or selected == marker:
+        return f"В окне «{winapi.window_title(target)}» ничего не выделено."
+    if len(selected) > MAX_READ_CHARS:
+        selected = selected[:MAX_READ_CHARS] + "\n…(обрезано)"
+    return f"Выделенный текст в окне «{winapi.window_title(target)}»:\n{selected}"
 
 
 _CALC_NAMES = {name: getattr(__import__("math"), name) for name in
@@ -1701,7 +1789,29 @@ def _signed(value: Any) -> str:
     return f"+{number}" if number > 0 else str(number)
 
 
+# Коды погоды WWO, которые отдаёт wttr.in (описание по-русски приходит не всегда)
+_WEATHER_CODES = {
+    113: "ясно", 116: "переменная облачность", 119: "облачно", 122: "пасмурно", 143: "дымка",
+    176: "местами дождь", 179: "местами снег", 182: "местами мокрый снег", 185: "местами изморось",
+    200: "возможна гроза", 227: "метель", 230: "сильная метель", 248: "туман", 260: "морозный туман",
+    263: "местами морось", 266: "морось", 281: "ледяная морось", 284: "сильная ледяная морось",
+    293: "местами небольшой дождь", 296: "небольшой дождь", 299: "временами дождь", 302: "дождь",
+    305: "временами сильный дождь", 308: "сильный дождь", 311: "небольшой ледяной дождь", 314: "ледяной дождь",
+    317: "небольшой мокрый снег", 320: "мокрый снег", 323: "местами небольшой снег", 326: "небольшой снег",
+    329: "местами снег", 332: "снег", 335: "местами сильный снег", 338: "сильный снег", 350: "ледяная крупа",
+    353: "небольшой ливень", 356: "ливень", 359: "сильный ливень", 362: "небольшой мокрый снег",
+    365: "мокрый снег", 368: "небольшой снегопад", 371: "снегопад", 374: "ледяная крупа", 377: "ледяная крупа",
+    386: "местами дождь с грозой", 389: "дождь с грозой", 392: "снег с грозой", 395: "сильный снег с грозой",
+}
+
+
 def _weather_desc(item: dict) -> str:
+    try:
+        code = int(item.get("weatherCode") or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if code in _WEATHER_CODES:
+        return _WEATHER_CODES[code]
     for key in ("lang_ru", "weatherDesc"):
         values = item.get(key) or []
         if values and values[0].get("value"):
@@ -1771,10 +1881,18 @@ def list_windows(ctx: CallContext) -> str:
     return "Открытые окна:\n" + "\n".join(f"- {title} ({process})" for _hwnd, title, process in windows[:40])
 
 
-def find_window(name: str) -> tuple[int, str] | None:
+def find_window(name: str, apps: "AppCatalog | None" = None) -> tuple[int, str] | None:
+    """Окно по названию программы («блокнот» → notepad.exe по списку приложений) или заголовку."""
+    windows = _app_windows()
+    entry = apps.find(name) if apps is not None else None
+    if entry and entry.process:
+        wanted = {p.lower() for p in entry.process}
+        for hwnd, title, process in windows:
+            if process.lower() in wanted:
+                return hwnd, title
     query = normalize(clean_app_name(name) or name)
     best: tuple[float, int, str] | None = None
-    for hwnd, title, process in _app_windows():
+    for hwnd, title, process in windows:
         stem = process.lower().removesuffix(".exe")
         score = max(app_name_score(query, title), app_name_score(query, stem))
         if best is None or score > best[0]:
@@ -1799,7 +1917,7 @@ _WINDOW_ACTIONS = {"focus": "Переключился на окно", "minimize"
 )
 def window_action(ctx: CallContext, name: str, action: str) -> str:
     winapi._require_windows()
-    found = find_window(name)
+    found = find_window(name, ctx.services.apps)
     if found is None:
         raise ToolError(f"не нашёл открытое окно «{name}» (list_windows покажет, какие окна открыты)")
     hwnd, title = found
@@ -1810,3 +1928,406 @@ def window_action(ctx: CallContext, name: str, action: str) -> str:
         command = {"minimize": winapi.SW_MINIMIZE, "maximize": winapi.SW_MAXIMIZE, "restore": winapi.SW_RESTORE}[action]
         winapi.show_window(hwnd, command)
     return f"{_WINDOW_ACTIONS[action]} «{title}»."
+
+
+# ═══ Память, сценарии, расписание, навыки ════════════════════════════
+
+@tool(
+    "memory",
+    "Долгая память о пользователе: action=remember — запомнить факт («Город — Казань», «любимый браузер — "
+    "Firefox», «по утрам я пью кофе»; город пиши в именительном падеже), action=forget — забыть факт (text — "
+    "о чём; «всё» — очистить). Запоминай, когда пользователь просит «запомни» или сообщает о себе что-то "
+    "важное надолго.",
+    {
+        "action": {"type": "string", "enum": ["remember", "forget"], "description": "remember — запомнить, forget — забыть"},
+        "text": {"type": "string", "description": "Факт одной фразой (для forget — о чём забыть)"},
+    },
+    required=("action", "text"),
+    quick=True,
+)
+def memory(ctx: CallContext, action: str, text: str) -> str:
+    store = ctx.services.memory
+    if action == "remember":
+        return store.remember(text)
+    removed = store.forget(text)
+    if not removed:
+        return f"Не нашёл в памяти ничего про «{text}»."
+    return "Забыл: " + "; ".join(removed) + "."
+
+
+LAUNCH_TOOLS = {"open_app", "open_url", "web_search", "open_folder", "open_file"}
+INPUT_TOOLS = {"type_text", "hotkey", "window_action", "clipboard", "screen", "media"}
+LAUNCH_SETTLE = 0.6
+
+
+class LaunchWatch:
+    """Шаги сценария идут подряд, без пауз на раздумья модели. Поэтому после запуска программы
+    ждём её окно и выводим его вперёд — иначе следующий шаг (ввод текста, сочетание клавиш)
+    попадёт в прежнее окно."""
+
+    def __init__(self, tool: str, next_tool: str | None):
+        self.active = winapi.IS_WINDOWS and tool in LAUNCH_TOOLS and next_tool in INPUT_TOOLS
+        self.windows = set(winapi.top_windows()) if self.active else set()
+        self.foreground = winapi.foreground_window() if self.active else 0
+
+    def wait(self, cancel: threading.Event, timeout: float = 6.0) -> None:
+        if not self.active:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not cancel.is_set():
+            current = winapi.foreground_window()
+            if current and current != self.foreground and winapi.window_pid(current) != os.getpid():
+                break
+            new = [hwnd for hwnd in winapi.top_windows() if hwnd not in self.windows and winapi.window_title(hwnd)]
+            if new:
+                winapi.activate_window(new[0], timeout=2)
+                break
+            time.sleep(0.2)
+        time.sleep(LAUNCH_SETTLE)  # окно появилось — даём программе дорисоваться и принять ввод
+
+
+def run_steps(registry: ToolRegistry, steps: list[dict], cancel: threading.Event,
+              on_start: Callable[[str, dict], None] = lambda tool, arguments: None,
+              on_result: Callable[[str, dict, ToolResult], None] = lambda tool, arguments, result: None,
+              ) -> list[ToolResult]:
+    """Выполняет шаги сценария по очереди (каждый — через реестр, с теми же подтверждениями)."""
+    results = []
+    for index, step in enumerate(steps):
+        if cancel.is_set():
+            break
+        tool, arguments = step["tool"], dict(step.get("arguments") or {})
+        watch = LaunchWatch(tool, steps[index + 1]["tool"] if index + 1 < len(steps) else None)
+        on_start(tool, arguments)
+        result = registry.execute(tool, arguments, cancel)
+        on_result(tool, arguments, result)
+        results.append(result)
+        if result.ok:
+            watch.wait(cancel)
+    return results
+
+
+def _run_steps(ctx: CallContext, title: str, steps: list[dict]) -> str:
+    registry = ctx.services.registry
+    if registry is None:
+        raise ToolError("сценарии недоступны")
+    results = run_steps(registry, steps, ctx.cancel, on_result=ctx.services.on_step)
+    lines = [f"{index}. {step['tool']}: {result.text}" for index, (step, result) in enumerate(zip(steps, results), 1)]
+    if len(results) < len(steps):
+        lines.append(f"{len(results) + 1}. остановлено пользователем")
+    failed = sum(not result.ok for result in results)
+    head = f"Сценарий «{title}» выполнен" + (f" с ошибками ({failed})" if failed else "") + "."
+    return head + "\n" + "\n".join(lines)
+
+
+@tool(
+    "routine",
+    "Сценарии — цепочки действий, которые потом выполняются одной фразой мгновенно, без раздумий: "
+    "action=save — сохранить (name и steps — JSON-список шагов [{\"tool\": \"open_app\", \"arguments\": "
+    "{\"name\": \"почта\"}}, …], только существующие инструменты), action=run — выполнить, list — показать, "
+    "delete — удалить. Пример: «рабочий режим» = открыть почту и мессенджер, громкость 30.",
+    {
+        "action": {"type": "string", "enum": ["save", "run", "list", "delete"], "description": "Что сделать"},
+        "name": {"type": "string", "description": "Название сценария, например «рабочий режим»"},
+        "steps": {"type": "string", "description": "Для save: JSON-список шагов"},
+    },
+    required=("action",),
+    quick=lambda args: args.get("action") in ("save", "delete"),
+)
+def routine(ctx: CallContext, action: str, name: str = "", steps: str = "") -> str:
+    from .routines import RoutineError
+
+    routines = ctx.services.routines
+    if action == "list":
+        items = routines.all()
+        if not items:
+            return "Сценариев пока нет. Скажите, например: «запомни как сценарий «рабочий режим»: открой почту и телеграм»."
+        return "Сценарии:\n" + "\n".join(
+            f"- «{title}»: " + ", ".join(s["tool"] for s in item["steps"]) for title, item in items.items())
+    if not name.strip():
+        raise ToolError("не указано название сценария")
+    try:
+        if action == "save":
+            parsed = routines.save(name, steps)
+            return f"Сценарий «{name.strip()}» сохранён ({len(parsed)} шаг.). Запуск — фразой «{name.strip()}»."
+        if action == "delete":
+            title = routines.delete(name)
+            return f"Сценарий «{title}» удалён." if title else f"Сценария «{name}» нет."
+    except RoutineError as exc:
+        raise ToolError(str(exc)) from None
+    found = routines.get(name)
+    if not found:
+        raise ToolError(f"сценария «{name}» нет (routine list покажет все)")
+    return _run_steps(ctx, found[0], found[1]["steps"])
+
+
+@tool(
+    "schedule",
+    "Расписание (повторяющиеся задачи): action=add — добавить: time «ЧЧ:ММ» и days («ежедневно», «будни», "
+    "«выходные» или «пн,ср,пт») либо every_minutes; что делать — routine (название сценария) или prompt "
+    "(просьба к тебе, например «расскажи утренний брифинг»). action=list — показать, delete — удалить "
+    "(name). Для разового напоминания используй timer.",
+    {
+        "action": {"type": "string", "enum": ["add", "list", "delete"], "description": "Что сделать"},
+        "name": {"type": "string", "description": "Название задачи"},
+        "time": {"type": "string", "description": "Время «ЧЧ:ММ»"},
+        "days": {"type": "string", "description": "Дни: ежедневно, будни, выходные или пн,ср,пт"},
+        "every_minutes": {"type": "number", "description": "Повторять каждые N минут (вместо time)", "minimum": 5,
+                          "maximum": 1440},
+        "routine": {"type": "string", "description": "Какой сценарий запустить"},
+        "prompt": {"type": "string", "description": "Или какую просьбу выполнить"},
+    },
+    required=("action",),
+    quick=lambda args: args.get("action") in ("add", "delete"),
+)
+def schedule(ctx: CallContext, action: str, name: str = "", time: str = "", days: str = "",
+             every_minutes: float = 0, routine: str = "", prompt: str = "") -> str:
+    from .routines import RoutineError
+
+    store = ctx.services.schedule
+    if action == "list":
+        tasks = store.all()
+        return ("Расписание:\n" + "\n".join("- " + store.describe(t) for t in tasks)) if tasks else "Расписание пусто."
+    if action == "delete":
+        removed = store.delete(name)
+        if removed:
+            ctx.services.on_schedule_changed()
+        return ("Удалено: " + ", ".join(f"«{n}»" for n in removed) + ".") if removed else f"Задачи «{name}» нет."
+    if routine and not ctx.services.routines.get(routine):
+        raise ToolError(f"сценария «{routine}» нет — сначала сохраните его (routine save)")
+    try:
+        task = store.add(name, time=time, days=days, every_minutes=every_minutes, routine=routine, prompt=prompt)
+    except RoutineError as exc:
+        raise ToolError(str(exc)) from None
+    ctx.services.on_schedule_changed()
+    return f"Добавил в расписание: {store.describe(task)}."
+
+
+def _confirm_skill(ctx: CallContext, action: str, name: str = "", description: str = "", instructions: str = "",
+                   code: str = "", arguments: str = "") -> Confirmation | None:
+    skills = ctx.services.skills
+    if action == "save" and code.strip():
+        return Confirmation("Новый навык с программой",
+                            f"Сохранить навык «{name}» со скриптом на Python. Потом Джарвис будет запускать "
+                            "этот скрипт без вопросов — проверьте код:", details=code[:6000])
+    if action == "use":
+        skill = skills.get(name)
+        if skill and skill.has_script and not skills.approved(skill):
+            return Confirmation("Запуск навыка", f"Скрипт навыка «{skill.title or skill.name}» новый или изменён "
+                                "после одобрения. Запустить его?", details=skill.script.read_text(encoding="utf-8")[:6000],
+                                data="approve")
+    if action == "delete" and skills.get(name):
+        return Confirmation("Удалить навык", f"Удалить навык «{name}» вместе с его файлами?")
+    return None
+
+
+@tool(
+    "skill",
+    "Навыки — то, чему ты научился (формат agentskills.io: инструкции и, если нужно, скрипт на Python). "
+    "action=save — сохранить навык: name, description (что делает и когда применять), instructions (как "
+    "выполнять по шагам), code (необязательно: скрипт на Python, аргументы — в sys.argv). action=use — "
+    "применить навык (arguments — строка аргументов для скрипта), list — список, delete — удалить. Если "
+    "пользователь просит похожую многошаговую задачу не первый раз — предложи сохранить её как навык.",
+    {
+        "action": {"type": "string", "enum": ["save", "use", "list", "delete"], "description": "Что сделать"},
+        "name": {"type": "string", "description": "Название навыка"},
+        "description": {"type": "string", "description": "Что делает и когда применять"},
+        "instructions": {"type": "string", "description": "Как выполнять: шаги, инструменты, подсказки"},
+        "code": {"type": "string", "description": "Скрипт на Python (необязательно)"},
+        "arguments": {"type": "string", "description": "Для use: аргументы скрипта одной строкой"},
+    },
+    required=("action",),
+    confirm=_confirm_skill,
+    quick=lambda args: args.get("action") in ("save", "delete"),
+)
+def skill(ctx: CallContext, action: str, name: str = "", description: str = "", instructions: str = "",
+          code: str = "", arguments: str = "") -> str:
+    skills = ctx.services.skills
+    if action == "list":
+        items = skills.all()
+        if not items:
+            return "Навыков пока нет."
+        return "Навыки:\n" + "\n".join(f"- {s.title or s.name}: {s.description}" + (" (со скриптом)" if s.has_script else "")
+                                       for s in items)
+    if not name.strip():
+        raise ToolError("не указано название навыка")
+    if action == "save":
+        if not description.strip():
+            raise ToolError("опишите навык (description): что делает и когда применять")
+        saved = skills.save(name, description, instructions, code)
+        return f"Навык «{saved.title or saved.name}» сохранён{' со скриптом' if saved.has_script else ''}: {saved.folder}."
+    if action == "delete":
+        title = skills.delete(name)
+        return f"Навык «{title}» удалён." if title else f"Навыка «{name}» нет."
+    found = skills.get(name)
+    if found is None:
+        raise ToolError(f"навыка «{name}» нет (skill list покажет все)")
+    parts = [f"Навык «{found.title or found.name}». Инструкции:\n{found.instructions}"]
+    if found.has_script:
+        if ctx.prepared == "approve":
+            skills.approve(found)
+        import shlex
+
+        argv = shlex.split(arguments, posix=not winapi.IS_WINDOWS) if arguments.strip() else []
+        timeout = float(ctx.config.get("tools.code_timeout", 60))
+        try:
+            result = subprocess.run([_python_executable(), "-X", "utf8", str(found.script), *argv],
+                                    cwd=str(found.folder), capture_output=True, timeout=timeout,
+                                    stdin=subprocess.DEVNULL, env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                                    creationflags=winapi.CREATE_NO_WINDOW if winapi.IS_WINDOWS else 0)
+        except subprocess.TimeoutExpired:
+            raise ToolError(f"скрипт навыка работал дольше {timeout:.0f} с и был остановлен") from None
+        output = (winapi.decode_output(result.stdout) + winapi.decode_output(result.stderr)).strip()
+        parts.append(f"Скрипт: код завершения {result.returncode}.\n{output[:3000] or '(нет вывода)'}")
+    return "\n\n".join(parts)
+
+
+@tool(
+    "restore_file",
+    "Откатить последнее изменение файла, сделанное Джарвисом (write_file сохраняет прежнюю версию). "
+    "Без пути — откатывает последний изменённый файл.",
+    {"path": {"type": "string", "description": "Файл (необязательно)"}},
+    quick=True,
+)
+def restore_file(ctx: CallContext, path: str = "") -> str:
+    target = str(resolve_file(path, ctx.config)) if path.strip() else ""
+    try:
+        restored, when = ctx.services.backups.restore(target)
+    except FileNotFoundError as exc:
+        raise ToolError(str(exc)) from None
+    return f"Вернул {restored.name} к версии от {when.replace('T', ' ')}. Текущую версию тоже сохранил."
+
+
+def _size_text(size: float) -> str:
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if size < 1024 or unit == "ГБ":
+            return f"{size:.0f} {unit}" if unit in ("Б", "КБ") else f"{size:.1f} {unit}".replace(".", ",")
+        size /= 1024
+    return str(size)
+
+
+@tool(
+    "disk_usage",
+    "Что занимает место: свободное место на дисках и самые большие папки и файлы в папке (по умолчанию — "
+    "в папке пользователя).",
+    {"path": {"type": "string", "description": "Папка (необязательно): «Загрузки», полный путь"}},
+)
+def disk_usage(ctx: CallContext, path: str = "") -> str:
+    lines = []
+    for part in psutil.disk_partitions(all=False):
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+        except OSError:
+            continue
+        lines.append(f"Диск {part.mountpoint}: свободно {_size_text(usage.free)} из {_size_text(usage.total)}.")
+    root = _folder_path(path) if path.strip() else Path.home()
+    if not root.is_dir():
+        raise ToolError(f"папка не найдена: {root}")
+    deadline = time.monotonic() + 12
+    sizes: dict[Path, int] = {}
+    big_files: list[tuple[int, Path]] = []
+    for entry in root.iterdir():
+        if entry.name.startswith(".") or entry.name.lower() in _SKIP_DIRS - {"appdata"}:
+            continue
+        total = 0
+        try:
+            if entry.is_file():
+                total = entry.stat().st_size
+                big_files.append((total, entry))
+            else:
+                for current, dirs, files in os.walk(entry):
+                    dirs[:] = [d for d in dirs if not d.startswith(".")]
+                    for name in files:
+                        try:
+                            size = os.path.getsize(os.path.join(current, name))
+                        except OSError:
+                            continue
+                        total += size
+                        if size > 200 * 1024 * 1024:
+                            big_files.append((size, Path(current) / name))
+                    if time.monotonic() > deadline:
+                        break
+        except OSError:
+            continue
+        sizes[entry] = total
+        if time.monotonic() > deadline:
+            lines.append("(подсчёт остановлен по времени — показано то, что успел)")
+            break
+    top = sorted(sizes.items(), key=lambda pair: pair[1], reverse=True)[:10]
+    lines.append(f"Больше всего места в {root}:")
+    lines += [f"- {item.name}: {_size_text(size)}" for item, size in top if size]
+    files = sorted(big_files, reverse=True)[:5]
+    if files:
+        lines.append("Крупные файлы:")
+        lines += [f"- {file}: {_size_text(size)}" for size, file in files]
+    return "\n".join(lines)
+
+
+@tool("briefing", "Брифинг: дата, погода, напоминания и расписание на сегодня, состояние компьютера. "
+                  "Для просьб «доброе утро», «что на сегодня», «брифинг».")
+def briefing(ctx: CallContext) -> str:
+    from .briefing import compose
+
+    return compose(ctx.services)
+
+
+# ═══ Зрение ══════════════════════════════════════════════════════════
+
+def _vision(ctx: CallContext):
+    if ctx.services.vision is None:
+        raise ToolError("зрение недоступно")
+    return ctx.services.vision
+
+
+def _confirm_screen(ctx: CallContext, action: str, question: str = "", target: str = "",
+                    double: bool = False) -> Confirmation | None:
+    if action != "click":
+        return None
+    if not target.strip():
+        raise ToolError("опишите, на что нажать (target)")
+    from .llm.base import LLMError
+
+    try:
+        location = _vision(ctx).locate(target)
+    except LLMError as exc:
+        raise ToolError(f"{exc.message} {exc.hint}".strip()) from None
+    if location is None:
+        raise ToolError(f"не нашёл на экране «{target}»")
+    ctx.prepared = location
+    if not ctx.config.get("tools.confirm_clicks", True):
+        return None
+    return Confirmation("Нажать на экране", f"{'Дважды нажать' if double else 'Нажать'} на «{location.label}» "
+                        f"(точка {location.x}, {location.y} — отмечена на снимке)?", image=location.preview,
+                        data=location)
+
+
+@tool(
+    "screen",
+    "Зрение — смотреть на экран через модель со зрением: action=look — ответить на вопрос о том, что на "
+    "экране (что открыто, прочитать текст или ошибку, найти что-то глазами); action=click — нажать мышью "
+    "на элемент, описанный словами (кнопка «Отправить», значок корзины, ссылка «Войти»), double=true — "
+    "двойной щелчок. Используй, когда нужного инструмента нет и действие можно сделать мышью.",
+    {
+        "action": {"type": "string", "enum": ["look", "click"], "description": "look — посмотреть, click — нажать"},
+        "question": {"type": "string", "description": "Для look: что нужно узнать"},
+        "target": {"type": "string", "description": "Для click: на что нажать"},
+        "double": {"type": "boolean", "description": "Двойной щелчок"},
+    },
+    required=("action",),
+    confirm=_confirm_screen,
+    quick=lambda args: args.get("action") == "click",
+)
+def screen(ctx: CallContext, action: str, question: str = "", target: str = "", double: bool = False) -> str:
+    from .llm.base import LLMError
+
+    if action == "look":
+        try:
+            answer = _vision(ctx).look(question)
+        except LLMError as exc:
+            raise ToolError(f"{exc.message} {exc.hint}".strip()) from None
+        return f"На экране: {answer}" if answer else "Модель не смогла разобрать снимок экрана."
+    location = ctx.prepared
+    if location is None:
+        raise ToolError("не удалось определить место клика")
+    gui = _pyautogui()
+    gui.click(location.x, location.y, clicks=2 if double else 1, interval=0.1)
+    return f"Нажал на «{location.label}»."

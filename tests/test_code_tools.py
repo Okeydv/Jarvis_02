@@ -115,10 +115,11 @@ def test_run_python_needs_confirmation_and_returns_output(config, code_dir):
 
 def test_run_python_file_and_timeout(config, code_dir):
     code_dir.mkdir(parents=True)
-    (code_dir / "hello.py").write_text("print('файл работает')", encoding="utf-8")
+    (code_dir / "hello.py").write_bytes("print('файл работает')\r\nprint(2)\r\n".encode("utf-8"))
     registry, recorder = registry_with(config)
     result = registry.execute("run_python", {"path": "hello.py"})
     assert "файл работает" in result.text and "hello.py" in recorder.asked[-1].text
+    assert recorder.asked[-1].details == "print('файл работает')\nprint(2)\n"  # без \r из Windows
     config.set("tools.code_timeout", 1)
     result = registry.execute("run_python", {"code": "import time\ntime.sleep(5)"})
     assert result.status == "error" and "дольше 1 с" in result.text
@@ -164,7 +165,7 @@ def test_calculate_rejects_unsafe_or_invalid(expression):
 
 WEATHER = {
     "current_condition": [{"temp_C": "12", "FeelsLikeC": "9", "windspeedKmph": "18", "humidity": "71",
-                           "lang_ru": [{"value": "Переменная облачность"}]}],
+                           "weatherCode": "116", "weatherDesc": [{"value": "Partly cloudy"}]}],
     "nearest_area": [{"areaName": [{"value": "Moscow"}]}],
     "weather": [
         {"mintempC": "7", "maxtempC": "14", "hourly": [{"chanceofrain": "10", "lang_ru": [{"value": "Ясно"}]},
@@ -222,8 +223,12 @@ def test_window_action(config, monkeypatch):
     assert registry.execute("window_action", {"name": "блокнот", "action": "minimize"}).ok
     assert activated == [202] and shown == [(101, winapi.SW_MINIMIZE)]
     assert registry.execute("window_action", {"name": "фотошоп", "action": "focus"}).status == "error"
+    # английский заголовок «Notepad» — окно находится по процессу из списка приложений
+    windows[0] = (101, "Untitled - Notepad", "notepad.exe")
+    assert registry.execute("window_action", {"name": "блокнот", "action": "maximize"}).ok
+    assert shown[-1] == (101, winapi.SW_MAXIMIZE)
     text = registry.execute("list_windows", {}).text
-    assert "Документ — Блокнот (notepad.exe)" in text
+    assert "Untitled - Notepad (notepad.exe)" in text
 
 
 def test_timer_at_time(config):

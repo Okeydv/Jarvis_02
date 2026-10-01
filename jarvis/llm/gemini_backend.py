@@ -184,6 +184,20 @@ class GeminiBackend(LLMBackend):
     def _is_thinking_error(self, exc: Exception) -> bool:
         return isinstance(exc, self.errors.ClientError) and "think" in str(exc).lower()
 
+    # ─── зрение ───
+    def supports_vision(self) -> bool:
+        return True
+
+    def vision(self, prompt: str, image: bytes, mime: str = "image/jpeg") -> str:
+        types = self.types
+        model = str(self.config.get("gemini.vision_model") or self.model)
+        try:
+            response = self.client.models.generate_content(
+                model=model, contents=[types.Part.from_bytes(data=image, mime_type=mime), prompt])
+        except Exception as exc:
+            raise self._translate(exc) from None
+        return response.text or ""
+
     # ─── запросы ───
     def check(self) -> str | None:
         try:

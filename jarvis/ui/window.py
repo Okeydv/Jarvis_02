@@ -14,6 +14,7 @@ import customtkinter as ctk
 
 from . import icons, theme
 from .dialogs import ConfirmDialog, SettingsDialog
+from .hud import Hud
 from .widgets import ArcReactor, ChatView, LogView, VoiceBars
 
 log = logging.getLogger(__name__)
@@ -35,7 +36,9 @@ class MainWindow(ctk.CTk):
         self._closing = False
         self._chat_request = 0
         self._bubble = None
-        self._log_card = None
+        self._log_cards: dict = {}
+        self._suggestion_cards: dict = {}
+        self.hud = None
         self._state = "loading"
         self._listening = False
         self._pulse_on = False
@@ -46,6 +49,7 @@ class MainWindow(ctk.CTk):
         self._scale = self._get_window_scaling()
         self._fit_to_screen()
         self._build()
+        self.set_hud(bool(self.app.config.get("ui.hud", True)))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Escape>", lambda _event: self.app.stop())
         self.bind_all("<Control-KeyPress>", self._on_ctrl_key, add="+")
@@ -150,7 +154,11 @@ class MainWindow(ctk.CTk):
         self.speak_switch = ctk.CTkSwitch(switches, text="Озвучивать ответы", font=self.fonts.body_bold,
                                           text_color=theme.TEXT, progress_color=theme.ACCENT_HOVER,
                                           command=self._on_speak)
-        self.speak_switch.pack(anchor="w", padx=14, pady=(8, 12))
+        self.speak_switch.pack(anchor="w", padx=14, pady=(8, 0))
+        self.dnd_switch = ctk.CTkSwitch(switches, text="Не беспокоить", font=self.fonts.body_bold,
+                                        text_color=theme.TEXT, progress_color=theme.ACCENT_HOVER,
+                                        command=lambda: self.app.set_dnd(bool(self.dnd_switch.get())))
+        self.dnd_switch.pack(anchor="w", padx=14, pady=(8, 12))
 
         self.reactor = ArcReactor(panel, size=self._px(220), bg=theme.PANEL, level=self._level)
         self.reactor.pack(pady=(14, 0))
@@ -293,9 +301,32 @@ class MainWindow(ctk.CTk):
             self.mic_button.configure(fg_color="#3b82f6" if self._pulse_on else theme.BLUE_HOVER)
         self.after(450, self._pulse_mic)
 
+    # ─── HUD поверх окон ───
+    def set_hud(self, enabled: bool) -> None:
+        if enabled and self.hud is None:
+            self.hud = Hud(self, self.fonts, on_click=self._restore_from_hud, is_main_visible=self._main_visible)
+            self.hud.set_state(self._state)
+        elif not enabled and self.hud is not None:
+            self.hud.destroy()
+            self.hud = None
+
+    def _main_visible(self) -> bool:
+        """Окно Джарвиса видно и активно — тогда HUD не нужен."""
+        try:
+            return self.state() not in ("iconic", "withdrawn") and self.focus_displayof() is not None
+        except (tk.TclError, KeyError):
+            return True
+
+    def _restore_from_hud(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
     # ─── обработчики событий ───
     def _ev_state(self, state: str, subtitle: str = "") -> None:
         self._state = state
+        if self.hud is not None:
+            self.hud.set_state(state, subtitle)
         color = theme.STATE_COLORS.get(state, theme.STATE_COLORS["idle"])
         self.reactor.set_state(state)
         self.logo.set_state(state)
@@ -352,17 +383,63 @@ class MainWindow(ctk.CTk):
         self._bubble = None
         self.chat.clear()
 
-    def _ev_log_start(self, time_text: str, tool: str, arguments: str) -> None:
-        self._log_card = self.log_view.add(time_text, tool, arguments)
+    @staticmethod
+    def _risk(tool: str) -> str:
+        from ..tools import TOOLS
 
-    def _ev_log_result(self, status: str, text: str) -> None:
-        if self._log_card is None:
-            self._log_card = self.log_view.add("", "—", "")
-        self._log_card.finish(status, text)
-        self._log_card = None
+        item = TOOLS.get(tool)
+        if item is None:
+            return "act"
+        if item.confirm is not None:
+            return "danger"
+        return "act" if item.quick else "read"
+
+    def _ev_log_start(self, log_id: str, time_text: str, tool: str, arguments: str) -> None:
+        self._log_cards[log_id] = self.log_view.add(time_text, tool, arguments, self._risk(tool))
+        if self.hud is not None:
+            self.hud.set_detail(f"{tool} {arguments}" if arguments not in ("", "{}") else tool)
+
+    def _ev_log_result(self, log_id: str, status: str, text: str) -> None:
+        card = self._log_cards.pop(log_id, None) or self.log_view.add("", "—", "")
+        card.finish(status, text)
+
+    def _ev_history(self, messages: list) -> None:
+        """Прошлый разговор после перезапуска."""
+        if not messages:
+            return
+        self.chat.add_divider("прошлый разговор")
+        for role, text in messages:
+            if role == "user":
+                self.chat.add_user(text, voice=False)
+            else:
+                self.chat.add_jarvis(text).render_rich()
+        self.chat.add_divider("продолжаем · «Новый диалог» — начать заново")
+
+    def _ev_jarvis_note(self, title: str, text: str) -> None:
+        self.chat.add_note(title, text)
+
+    def _ev_suggestion(self, suggestion) -> None:
+        card = self.chat.add_suggestion(
+            suggestion.text, lambda answer, sid=suggestion.id: self.app.answer_suggestion(sid, answer))
+        self._suggestion_cards[suggestion.id] = card
+        if self.hud is not None:
+            self.hud.flash("Есть предложение")
+
+    def _ev_suggestion_answered(self, suggestion_id: str, answer: str) -> None:
+        card = self._suggestion_cards.pop(suggestion_id, None)
+        if card is not None:
+            try:
+                card.answered(answer)
+            except tk.TclError:
+                pass
+
+    def _ev_dnd(self, enabled: bool) -> None:
+        self._set_switch(self.dnd_switch, enabled)
 
     def _ev_heard(self, text: str) -> None:
         self.heard_label.configure(text=f"«{text}»" if text else "")
+        if text and self.hud is not None:
+            self.hud.set_detail(f"Слышу: «{text}»")
 
     def _ev_mic(self, listening: bool) -> None:
         self._listening = listening

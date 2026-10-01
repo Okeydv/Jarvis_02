@@ -259,6 +259,20 @@ def system_close_window(hwnd: int) -> None:
         user32.PostMessageW(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0)
 
 
+def idle_seconds() -> float:
+    """Сколько секунд пользователь не трогал мышь и клавиатуру (0, если узнать нельзя)."""
+    if not IS_WINDOWS:
+        return 0.0
+
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+    info = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO), 0)
+    if not user32.GetLastInputInfo(ctypes.byref(info)):
+        return 0.0
+    return max(0.0, ((kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0)
+
+
 def show_window(hwnd: int, command: int) -> bool:
     """Свернуть (SW_MINIMIZE), развернуть (SW_MAXIMIZE) или восстановить (SW_RESTORE) окно."""
     if not is_window(hwnd):

@@ -178,6 +178,7 @@ class Bubble(ctk.CTkFrame):
         "jarvis": (theme.JARVIS_BUBBLE, theme.BORDER, theme.TEXT, theme.ACCENT),
         "error": (theme.ERROR_BG, theme.ERROR_BORDER, theme.ERROR_TEXT, "#fca5a5"),
         "report": (theme.CARD, theme.BORDER, theme.TEXT, theme.ACCENT),
+        "note": (theme.NOTE_BG, theme.NOTE_BORDER, theme.TEXT, theme.NOTE_TITLE),
     }
 
     def __init__(self, master, role: str, title: str, text: str, fonts: theme.Fonts, wrap: int, hint: str = ""):
@@ -246,6 +247,37 @@ class Bubble(ctk.CTkFrame):
     def _copy(self) -> None:
         self.clipboard_clear()
         self.clipboard_append(self.text)
+
+
+class SuggestionCard(ctk.CTkFrame):
+    """Джарвис сам предлагает помощь: «Да» / «Не сейчас» / «Не предлагать»."""
+
+    def __init__(self, master, text: str, fonts: theme.Fonts, wrap: int, on_answer: Callable[[str], None]):
+        super().__init__(master, fg_color=theme.NOTE_BG, corner_radius=16, border_width=1, border_color=theme.NOTE_BORDER)
+        self.on_answer = on_answer
+        self.fonts = fonts
+        ctk.CTkLabel(self, text="ДЖАРВИС ПРЕДЛАГАЕТ", font=fonts.tiny_bold, text_color=theme.NOTE_TITLE, anchor="w",
+                     height=16).pack(fill="x", padx=14, pady=(8, 0))
+        self.label = ctk.CTkLabel(self, text=text, font=fonts.body, text_color=theme.TEXT, justify="left", anchor="w",
+                                  wraplength=wrap)
+        self.label.pack(fill="x", padx=14, pady=(2, 6))
+        self.buttons = ctk.CTkFrame(self, fg_color="transparent")
+        self.buttons.pack(fill="x", padx=10, pady=(0, 10))
+        for label, answer, color, hover in (("Да", "yes", theme.BLUE, theme.BLUE_HOVER),
+                                            ("Не сейчас", "later", theme.SECONDARY, theme.SECONDARY_HOVER),
+                                            ("Не предлагать", "never", theme.SECONDARY, theme.SECONDARY_HOVER)):
+            ctk.CTkButton(self.buttons, text=label, height=30, width=110 if answer != "never" else 140,
+                          corner_radius=10, font=fonts.small_bold, fg_color=color, hover_color=hover,
+                          text_color=theme.TEXT, command=lambda a=answer: self.on_answer(a)).pack(side="left", padx=4)
+
+    def answered(self, answer: str) -> None:
+        for child in self.buttons.winfo_children():
+            child.destroy()
+        text = {"yes": "✓ Вы согласились", "later": "Отложено", "never": "Больше не предлагаю"}.get(answer, answer)
+        ctk.CTkLabel(self.buttons, text=text, font=self.fonts.small, text_color=theme.MUTED).pack(side="left", padx=6)
+
+    def set_wrap(self, wrap: int) -> None:
+        self.label.configure(wraplength=wrap)
 
 
 class CodeBlock(ctk.CTkFrame):
@@ -349,6 +381,21 @@ class ChatView(ctk.CTkScrollableFrame):
     def add_report(self, title: str, text: str) -> Bubble:
         return self._bubble("report", title.upper(), text, "left")
 
+    def add_note(self, title: str, text: str) -> Bubble:
+        """Джарвис сам: брифинг, «пока вас не было»."""
+        return self._bubble("note", f"{title.upper()} · {self._now()}", text, "left")
+
+    def add_suggestion(self, text: str, on_answer: Callable[[str], None]) -> SuggestionCard:
+        card = SuggestionCard(self._row(), text, self.fonts, self._wrap, on_answer)
+        card.pack(side="left")
+        self._bubbles.append(card)  # type: ignore[arg-type] — у карточки тоже есть set_wrap
+        self.scroll_to_end()
+        return card
+
+    def add_divider(self, text: str) -> None:
+        row = self._row()
+        ctk.CTkLabel(row, text=f"— {text} —", font=self.fonts.small, text_color=theme.FAINT).pack(pady=4)
+
     def add_system(self, text: str) -> None:
         row = self._row()
         note = ctk.CTkLabel(row, text=text, font=self.fonts.small, text_color=theme.MUTED, wraplength=self._wide,
@@ -380,15 +427,19 @@ class ChatView(ctk.CTkScrollableFrame):
 
 
 class LogCard(ctk.CTkFrame):
-    def __init__(self, master, time_text: str, tool: str, arguments: str, fonts: theme.Fonts, wrap: int):
+    def __init__(self, master, time_text: str, tool: str, arguments: str, fonts: theme.Fonts, wrap: int,
+                 risk: str = "act"):
         super().__init__(master, fg_color=theme.CARD, corner_radius=12, border_width=1, border_color=theme.BORDER)
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=12, pady=(10, 2))
         self.pill = ctk.CTkLabel(top, text=theme.STATUS_TITLES["pending"], font=fonts.tiny_bold, height=20,
                                  fg_color=theme.STATUS_COLORS["pending"], corner_radius=8, text_color="#0b1220", padx=8)
         self.pill.pack(side="right")
+        # Уровень риска: чтение — молча, действие, опасное — только с подтверждением
+        ctk.CTkLabel(top, text="●", font=fonts.small, text_color=theme.RISK_COLORS.get(risk, theme.MUTED),
+                     width=12).pack(side="left")
         ctk.CTkLabel(top, text=tool, font=fonts.mono_bold, text_color=theme.ACCENT, anchor="w").pack(
-            side="left", fill="x", expand=True)
+            side="left", fill="x", expand=True, padx=(4, 0))
         self.labels = []
         meta = time_text
         if arguments and arguments != "{}":
@@ -431,11 +482,11 @@ class LogView(ctk.CTkScrollableFrame):
                 for label in card.labels:
                     label.configure(wraplength=wrap)
 
-    def add(self, time_text: str, tool: str, arguments: str) -> LogCard:
+    def add(self, time_text: str, tool: str, arguments: str, risk: str = "act") -> LogCard:
         if self._empty is not None:
             self._empty.destroy()
             self._empty = None
-        card = LogCard(self, time_text, tool, arguments, self.fonts, self._wrap)
+        card = LogCard(self, time_text, tool, arguments, self.fonts, self._wrap, risk)
         card.pack(fill="x", padx=10, pady=5)
         self._cards.append(card)
         while len(self._cards) > self.MAX_CARDS:

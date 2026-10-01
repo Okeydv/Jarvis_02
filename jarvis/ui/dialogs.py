@@ -68,6 +68,12 @@ class ConfirmDialog(ctk.CTkToplevel):
         ctk.CTkLabel(titles, text=confirmation.title, font=fonts.title, text_color=theme.TEXT, anchor="w").pack(anchor="w")
         ctk.CTkLabel(body, text=confirmation.text, font=fonts.body, text_color=theme.TEXT, wraplength=540,
                      justify="left", anchor="w").pack(fill="x", pady=(16, 6))
+        if confirmation.image is not None:  # например, место клика на снимке экрана
+            picture = confirmation.image
+            scale = min(1.0, 420 / max(picture.width, picture.height))
+            self._image = ctk.CTkImage(light_image=picture, dark_image=picture,
+                                       size=(int(picture.width * scale), int(picture.height * scale)))
+            ctk.CTkLabel(body, text="", image=self._image).pack(pady=6)
         if confirmation.details:
             details = ctk.CTkTextbox(body, width=560, height=150, wrap="word", font=fonts.mono, fg_color=theme.INPUT,
                                      border_width=1, border_color=theme.BORDER, text_color=theme.TEXT)
@@ -148,6 +154,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self._build_voice(tabs.add("Голос"))
         self._build_pc(tabs.add("Доступ к ПК"))
         self._build_models(tabs.add("Модели"))
+        self._build_memory(tabs.add("Память"))
         self._build_diagnostics(tabs.add("Диагностика"))
         self.tabs = tabs
 
@@ -356,6 +363,77 @@ class SettingsDialog(ctk.CTkToplevel):
         row = self._section(page, "Файлы программы", "Ключи хранятся в файле .env в папке программы.")
         self._button(row, "Открыть папку Джарвиса", lambda: open_in_explorer(ROOT_DIR), "folder", 230).pack(side="left")
 
+    def _build_memory(self, tab) -> None:
+        page = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        page.pack(fill="both", expand=True)
+        services = self.app.services
+        row = self._section(page, "Что Джарвис о вас помнит",
+                            "По одному факту в строке. Можно дописать или удалить — изменения применятся по «Сохранить». "
+                            "Голосом: «запомни, что…», «забудь…».")
+        self.memory_box = ctk.CTkTextbox(page, height=130, font=self.fonts.body, fg_color=theme.INPUT, border_width=1,
+                                         border_color=theme.BORDER, text_color=theme.TEXT, wrap="word")
+        self._memory_text = "\n".join(services.memory.facts())
+        self.memory_box.insert("1.0", self._memory_text)
+        self.memory_box.pack(fill="x", pady=(4, 0))
+        row = self._row(page)
+        self.save_history = self._switch(row, "Помнить разговор после перезапуска",
+                                         bool(self.cfg.get("memory.save_history", True)))
+        self.save_history.pack(side="left")
+        row = self._row(page)
+        self.active_window = self._switch(row, "Учитывать активное окно («исправь это», «что тут»)",
+                                          bool(self.cfg.get("context.active_window", True)))
+        self.active_window.pack(side="left")
+
+        row = self._section(page, "Сценарии, расписание и навыки",
+                            "Сценарий — цепочка действий одной фразой («рабочий режим»), расписание — повтор по времени, "
+                            "навык — то, чему Джарвис научился. Создаются голосом: «запомни как сценарий…», «каждый будний "
+                            "день в 9 утра…», «сохрани это как навык».")
+        lines = [f"Сценарий «{name}»: " + ", ".join(step["tool"] for step in item["steps"])
+                 for name, item in services.routines.all().items()]
+        lines += ["По расписанию " + services.schedule.describe(task) for task in services.schedule.all()]
+        lines += [f"Навык «{skill.title or skill.name}»: {skill.description}" for skill in services.skills.all()]
+        summary = ctk.CTkTextbox(page, height=110, font=self.fonts.small, fg_color=theme.INPUT, border_width=1,
+                                 border_color=theme.BORDER, text_color=theme.TEXT, wrap="word")
+        summary.insert("1.0", "\n".join(lines) or "Пока пусто.")
+        summary.configure(state="disabled")
+        summary.pack(fill="x", pady=(4, 0))
+        row = self._row(page)
+        from ..storage import data_folder
+
+        self._button(row, "Папка с данными", lambda: open_in_explorer(data_folder(self.cfg)), "folder", 180).pack(side="left")
+
+        row = self._section(page, "Джарвис сам предлагает помощь",
+                            "Раз в несколько минут проверяет диск, батарею, память и процессор и, если что-то не так, "
+                            "предлагает помочь. Не чаще двух раз в час, не в тихие часы и не в режиме «Не беспокоить».")
+        self.proactive = self._switch(row, "Предлагать помощь", bool(self.cfg.get("proactive.enabled", True)))
+        self.proactive.pack(side="left")
+        row = self._row(page)
+        self.briefing = self._switch(row, "Утренний брифинг (погода, дела, состояние ПК)",
+                                     bool(self.cfg.get("proactive.morning_briefing", True)))
+        self.briefing.pack(side="left")
+        row = self._row(page)
+        ctk.CTkLabel(row, text="Город для погоды:", font=self.fonts.small, text_color=theme.MUTED).pack(side="left")
+        self.city = self._entry(row, str(self.cfg.get("briefing.city", "") or ""), 200)
+        self.city.pack(side="left", padx=8)
+        row = self._row(page)
+        ctk.CTkLabel(row, text="Тихие часы:", font=self.fonts.small, text_color=theme.MUTED).pack(side="left")
+        self.quiet_hours = self._entry(row, str(self.cfg.get("proactive.quiet_hours", "23:00-08:00")), 140)
+        self.quiet_hours.pack(side="left", padx=8)
+        self._button(row, "Брифинг сейчас", self.app.briefing_now, "play", 170).pack(side="left", padx=4)
+        row = self._row(page)
+        self.hud = self._switch(row, "Мини-индикатор поверх окон (HUD)", bool(self.cfg.get("ui.hud", True)))
+        self.hud.pack(side="left")
+        muted = self.app.proactive.muted_kinds()
+        if muted:
+            row = self._row(page)
+            ctk.CTkLabel(row, text=f"Отключённые предложения: {len(muted)}", font=self.fonts.small,
+                         text_color=theme.MUTED).pack(side="left")
+            self._button(row, "Снова предлагать всё", self._unmute, "refresh", 200).pack(side="left", padx=8)
+
+    def _unmute(self) -> None:
+        self.app.proactive.unmute_all()
+        self.saved.configure(text="Предложения снова включены", text_color=theme.STATUS_COLORS["ok"])
+
     def _build_diagnostics(self, tab) -> None:
         top = ctk.CTkFrame(tab, fg_color="transparent")
         top.pack(fill="x", pady=(6, 4))
@@ -483,11 +561,23 @@ class SettingsDialog(ctk.CTkToplevel):
             "gemini.model": self.gemini_model.get().strip(),
             "gemini.proxy": self.gemini_proxy.get().strip(),
             "qwen.model": self.qwen_model.get().strip(),
+            "memory.save_history": bool(self.save_history.get()),
+            "context.active_window": bool(self.active_window.get()),
+            "proactive.enabled": bool(self.proactive.get()),
+            "proactive.morning_briefing": bool(self.briefing.get()),
+            "proactive.quiet_hours": self.quiet_hours.get().strip(),
+            "briefing.city": self.city.get().strip(),
+            "ui.hud": bool(self.hud.get()),
         }
         return {key: value for key, value in values.items() if value != self.cfg.get(key)}
 
     def _save(self) -> None:
         changes = self._collect()
+        memory_text = self.memory_box.get("1.0", "end").strip()
+        if memory_text != self._memory_text:
+            self.app.services.memory.set_all(memory_text.splitlines())
+            self._memory_text = memory_text
+            changes["memory"] = True
         secrets = {name: entry.get().strip() for name, entry in self._secrets.items() if entry.get().strip()}
         if secrets:
             self.app.save_secrets(secrets)
@@ -498,7 +588,7 @@ class SettingsDialog(ctk.CTkToplevel):
                                 placeholder_text_color=theme.STATUS_COLORS["ok"])
                 self.focus_set()
         if changes:
-            self.app.apply_settings(changes)
+            self.app.apply_settings({k: v for k, v in changes.items() if k != "memory"})
         total = len(changes) + len(secrets)
         if total:
             self.saved.configure(text=f"Сохранено: {total} изм.", text_color=theme.STATUS_COLORS["ok"])

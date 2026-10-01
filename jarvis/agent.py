@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-import re
-
 from .config import DEFAULT_SYSTEM_PROMPT
 from .llm.base import LLMBackend, LLMError, ToolCall
 from .text_utils import normalize
-from .tools import TOOLS, ToolRegistry, ToolResult
+from .tools import TOOLS, ToolRegistry, ToolResult, run_steps
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +65,23 @@ def quick_reply(results: list[ToolResult], said_something: bool) -> str:
     return reply
 
 
+CODE_TOOLS = {"write_file", "run_python", "read_file", "skill"}
+
+
+def with_context(window: list[dict], context: str) -> list[dict]:
+    """Контекст (активное окно) — к текущей реплике пользователя, только для модели, не в историю.
+    Системный промпт не меняется, поэтому локальная модель не пересчитывает его заново."""
+    if not context:
+        return window
+    last_user = max((i for i, m in enumerate(window) if m["role"] == "user"), default=None)
+    if last_user is None:
+        return window
+    message = window[last_user]
+    window = list(window)
+    window[last_user] = {**message, "content": f"{message['content']}\n\n({context}; упоминай, только если это к месту)"}
+    return window
+
+
 _SHORT_TOOL_RESULT = 600
 _SHORT_ARGUMENT = 400
 
@@ -113,11 +129,13 @@ def trim_history(history: list[dict], limit: int) -> list[dict]:
 
 
 class Agent:
-    def __init__(self, config, registry: ToolRegistry, get_backend: Callable[[], LLMBackend], events: AgentEvents):
+    def __init__(self, config, registry: ToolRegistry, get_backend: Callable[[], LLMBackend], events: AgentEvents,
+                 context: Callable[[], str] | None = None):
         self.config = config
         self.registry = registry
         self.get_backend = get_backend
         self.events = events
+        self.context = context or (lambda: "")
         self.history: list[dict] = []
         self._lock = threading.Lock()
 
@@ -139,15 +157,35 @@ class Agent:
             if len(self.history) > MAX_STORED_MESSAGES:
                 self.history[:] = trim_history(self.history, MAX_STORED_MESSAGES)
 
+    def build_system(self, tools: list[dict]) -> str:
+        """Системный промпт: характер + что Джарвис помнит, его сценарии и навыки."""
+        system = str(self.config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT).strip()
+        services = self.registry.services
+        for block in (services.memory.prompt_block, services.routines.prompt_block, services.skills.prompt_block):
+            try:
+                text = block()
+            except Exception:  # повреждённый файл памяти не должен мешать отвечать
+                log.exception("Не удалось прочитать данные для промпта")
+                text = ""
+            if text:
+                system += "\n\n" + text
+        if any(t["name"] == "run_powershell" for t in tools):
+            system += ("\nДля задач на компьютере, для которых нет отдельного инструмента, используй "
+                       "run_powershell — пользователь подтверждает каждую команду.")
+        return system
+
     def run(self, user_text: str, cancel: threading.Event) -> AgentOutcome:
         max_steps = max(1, int(self.config.get("llm.max_steps", 5)))
         limit = max(2, int(self.config.get("llm.history_messages", 20)))
-        system = str(self.config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT).strip()
         outcome = AgentOutcome()
 
         self._append({"role": "user", "content": user_text})
         with self._lock:
             start_length = len(self.history)
+
+        routine_name = self._match_routine(user_text)
+        if routine_name:
+            return self._run_routine(routine_name, cancel, outcome)
 
         try:
             backend = self.get_backend()
@@ -157,17 +195,21 @@ class Agent:
             outcome.failed = True
             return outcome
         tools = self.registry.schemas()
-        if any(t["name"] == "run_powershell" for t in tools):
-            system += ("\nДля задач на компьютере, для которых нет отдельного инструмента, используй "
-                       "run_powershell — пользователь подтверждает каждую команду.")
+        system = self.build_system(tools)
+        try:
+            context = self.context()
+        except Exception:
+            context = ""
 
-        for step in range(max_steps):
+        step = 0
+        while step < max_steps:
             if cancel.is_set():
                 break
             allow_tools = step < max_steps - 1  # последний шаг — только текстовый ответ
+            step += 1
             self.events.on_state("thinking")
             with self._lock:
-                window = compact_history(trim_history(self.history, limit))
+                window = with_context(compact_history(trim_history(self.history, limit)), context)
             try:
                 turn = backend.stream_chat(system, window, tools, allow_tools, cancel, self.events.on_text)
             except LLMError as exc:
@@ -215,6 +257,10 @@ class Agent:
                 if not result.ok:
                     outcome.tool_failures += 1
 
+            if any(call.name in CODE_TOOLS for call in calls):
+                # Задача с кодом: написать → запустить → увидеть ошибку → исправить — нужно больше шагов.
+                max_steps = max(max_steps, int(self.config.get("llm.max_steps_code", 10)))
+
             if self._can_answer_now(user_text, calls, results, cancel):
                 # Простое действие выполнено — результат и есть ответ: второй запрос к модели
                 # занял бы ещё несколько секунд (на локальной модели — десятки).
@@ -226,6 +272,46 @@ class Agent:
                 break
 
         outcome.cancelled = cancel.is_set()
+        self._truncate()
+        return outcome
+
+    def _match_routine(self, user_text: str) -> str | None:
+        try:
+            return self.registry.services.routines.match(user_text)
+        except Exception:
+            log.exception("Не удалось проверить сценарии")
+            return None
+
+    def _run_routine(self, title: str, cancel: threading.Event, outcome: AgentOutcome) -> AgentOutcome:
+        """Сценарий выполняется сразу, без модели: это мгновенно и не тратит лимиты."""
+        found = self.registry.services.routines.get(title)
+        steps = found[1]["steps"] if found else []
+        self.events.on_state("executing")
+        failures = []
+        current: list[ToolCall] = []
+
+        def started(tool: str, arguments: dict) -> None:
+            current[:] = [ToolCall(name=tool, arguments=arguments)]
+            self.events.on_tool_start(current[0])
+
+        def finished(tool: str, arguments: dict, result: ToolResult) -> None:
+            self.events.on_tool_result(current[0], result)
+            outcome.tools_used += 1
+            if not result.ok:
+                outcome.tool_failures += 1
+                failures.append(f"{tool}: {result.text}")
+
+        run_steps(self.registry, steps, cancel, on_start=started, on_result=finished)
+        if cancel.is_set():
+            reply = f"Сценарий «{title}» остановлен."
+        elif failures:
+            reply = f"Сценарий «{title}» выполнен, но не всё прошло гладко, сэр: {failures[0]}"
+        else:
+            reply = f"Сценарий «{title}» выполнен, сэр."
+        self.events.on_text(reply)
+        self.events.on_turn_end()
+        self._append({"role": "assistant", "content": reply})
+        outcome.text, outcome.fast, outcome.cancelled = reply, True, cancel.is_set()
         self._truncate()
         return outcome
 

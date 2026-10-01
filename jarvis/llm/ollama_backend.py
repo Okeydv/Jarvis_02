@@ -71,6 +71,12 @@ class ThinkFilter:
         return self._start(rest)
 
 
+def strip_think(text: str) -> str:
+    """Текст без блоков <think>…</think>."""
+    think_filter = ThinkFilter()
+    return (think_filter.feed(text) + think_filter.flush()).strip()
+
+
 _JSON_START_RE = re.compile(r"^\s*(?:```(?:json)?\s*)?(?:<tool_call>\s*)?[\[{]")
 
 
@@ -134,6 +140,7 @@ class OllamaBackend(LLMBackend):
             kwargs["trust_env"] = False  # системный прокси не должен перехватывать localhost
         self.client = ollama.Client(host=self.host, **kwargs)
         self._think_supported = True
+        self._main_has_vision: bool | None = None
 
     @property
     def model(self) -> str:
@@ -198,6 +205,38 @@ class OllamaBackend(LLMBackend):
             raise LLMError(f"Модель «{self.model}» не умеет вызывать инструменты — управлять ПК она не сможет.",
                            "Установите модель с поддержкой tools: ollama pull qwen3:8b")
         return None
+
+    # ─── зрение ───
+    def _vision_model(self) -> str:
+        model = str(self.config.get("ollama.vision_model") or "").strip()
+        if model:
+            return model
+        if self._main_has_vision is None:
+            try:
+                capabilities = getattr(self.client.show(self.model), "capabilities", None) or []
+                self._main_has_vision = "vision" in capabilities
+            except Exception:
+                self._main_has_vision = False
+        return self.model if self._main_has_vision else ""
+
+    def supports_vision(self) -> bool:
+        return bool(self._vision_model())
+
+    def vision(self, prompt: str, image: bytes, mime: str = "image/jpeg") -> str:
+        model = self._vision_model()
+        if not model:
+            raise LLMError("У локальной модели нет зрения.",
+                           "Скачайте модель со зрением: ollama pull qwen2.5vl:7b — и укажите её в config.yaml → "
+                           "ollama.vision_model.")
+        try:
+            response = self.client.chat(model=model, messages=[{"role": "user", "content": prompt, "images": [image]}],
+                                        options={"temperature": 0.2, "num_ctx": int(self.config.get("ollama.num_ctx", 12288))},
+                                        keep_alive=self.config.get("ollama.keep_alive", "2h"))
+        except self._ollama.ResponseError as exc:
+            raise self._response_error(exc) from None
+        except (ConnectionError, httpx.TransportError):
+            raise self._connection_error() from None
+        return strip_think(response.message.content or "")
 
     def _options(self) -> dict:
         return {

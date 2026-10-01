@@ -36,7 +36,12 @@ DEFAULT_SYSTEM_PROMPT = (
     "Ты умеешь программировать. Если просят написать программу, скрипт, сайт или игру — сохрани код "
     "в файл инструментом write_file (он откроется в редакторе) и коротко скажи, что сделал; код вслух "
     "не зачитывай. Запустить программу на Python — run_python (пользователь подтверждает запуск; "
-    "программы с окном и игры — с wait=false).\n"
+    "программы с окном и игры — с wait=false). Если программа упала — прочитай ошибку, исправь код и "
+    "запусти снова.\n"
+    "Ты помнишь пользователя между разговорами: если он просит запомнить или сообщает о себе что-то "
+    "надолго — memory. Повторяющуюся цепочку действий предложи сохранить как сценарий (routine), "
+    "повторяющуюся задачу — как навык (skill). Если нужного инструмента нет, а сделать можно глазами и "
+    "мышью — screen (look — посмотреть на экран, click — нажать).\n"
     "Пользователь обычно говорит голосом: его речь распознаётся и приходит тебе текстом, возможны "
     "ошибки распознавания — угадывай смысл. Ответ будет озвучен, поэтому пиши обычным текстом без "
     "markdown, списков и эмодзи.\n"
@@ -46,14 +51,24 @@ DEFAULT_SYSTEM_PROMPT = (
 
 # Значения по умолчанию: используются, если в config.yaml чего-то нет.
 DEFAULTS: dict[str, Any] = {
-    "llm": {"backend": "ollama", "max_steps": 5, "history_messages": 20, "timeout": 300, "fast_replies": True},
+    "llm": {"backend": "ollama", "max_steps": 5, "max_steps_code": 10, "history_messages": 20, "timeout": 300,
+            "fast_replies": True},
+    "paths": {"data": ""},
+    "memory": {"save_history": True},
+    "context": {"active_window": True},
+    "proactive": {"enabled": True, "dnd": False, "interval_minutes": 10, "max_per_hour": 2, "cooldown_hours": 6,
+                  "quiet_hours": "23:00-08:00", "morning_briefing": True},
+    "briefing": {"city": ""},
+    "vision": {"backend": "auto"},
+    "ui": {"hud": True},
     "ollama": {
         "host": "http://localhost:11434",
         "model": "qwen3:8b",
         "think": False,
         "temperature": 0.4,
         "keep_alive": "2h",
-        "num_ctx": 12288,
+        "num_ctx": 16384,
+        "vision_model": "",
         "preload": True,
     },
     "gigachat": {
@@ -108,6 +123,7 @@ DEFAULTS: dict[str, Any] = {
         "allow_powershell": False,
         "powershell_timeout": 30,
         "allow_code": True,
+        "confirm_clicks": True,
         "code_timeout": 60,
         "code_folder": "",
         "code_editor": "",

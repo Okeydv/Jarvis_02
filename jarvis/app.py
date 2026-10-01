@@ -15,22 +15,31 @@ import threading
 import time
 from datetime import datetime
 
+import psutil
+
 from . import winapi
 from .agent import Agent
 from .config import Config
 from .hotkey import GlobalHotkey
 from .llm import BACKEND_TITLES, LLMBackend, LLMError, create_backend
 from .llm.base import ToolCall
+from .memory import HistoryStore
+from .proactive import Proactive, Suggestion, suggestion_answer
+from .routines import Scheduler
+from .storage import data_folder
 from .stt import Listener, VoiceError, list_input_devices
 from .text_utils import SentenceSplitter, contains_stop_word, find_wake_word, is_stop_phrase, normalize
 from .tools import Confirmation, ToolRegistry, ToolResult, ToolServices
 from .tts import Speaker, SpeechError
 from .ui import MainWindow
+from .vision import VisionService
 
 log = logging.getLogger(__name__)
 
 # Какой бэкенд использует ключ из .env
 _SECRET_BACKENDS = {"GIGACHAT_CREDENTIALS": "gigachat", "GEMINI_API_KEY": "gemini", "BAZAARLINK_API_KEY": "qwen"}
+# Ответы на предложение Джарвиса голосом или текстом
+SUGGESTION_ANSWER_SECONDS = 90
 
 
 class ConfirmRequest:
@@ -89,14 +98,28 @@ class JarvisApp:
         self._wake_until = 0.0
         self._speaking = False
         self._closing = False
+        self._suggestions: dict[str, Suggestion] = {}
+        self._pending_suggestion: tuple[Suggestion, float] | None = None
+        self._listen_after_speech = False
+        self._log_ids = itertools.count(1)
 
         self.speaker = Speaker(config, on_speaking=self._on_speaking, on_error=self._on_voice_error)
         self.listener = Listener(config, on_partial=self._on_partial, on_final=self._on_final,
                                  on_listening=self._on_listening, on_error=self._on_voice_error,
                                  on_wake=self._on_wake, on_device=self._on_device)
         self.services = ToolServices(config, confirm=self.ask_confirmation, notify=self.notify, focus=self.focus)
+        self.services.on_step = self._on_nested_step
+        self.services.vision = VisionService(config, self._get_backend, lambda: self.backend_name)
         self.registry = ToolRegistry(self.services)
-        self.agent = Agent(config, self.registry, self._backend, self)
+        self.agent = Agent(config, self.registry, self._backend, self, context=self._context_text)
+        folder = data_folder(config)
+        self.history_store = HistoryStore(folder / "history.json")
+        self.scheduler = Scheduler(self.services.schedule, self._on_schedule_due)
+        self.proactive = Proactive(config, folder / "proactive.json", deliver=self._deliver_suggestion,
+                                   on_briefing=self._auto_briefing, on_return=self._on_user_return,
+                                   idle_seconds=winapi.idle_seconds,
+                                   busy=lambda: self._current is not None or self._speaking
+                                   or self._pending_confirm is not None)
         self.hotkey = GlobalHotkey(str(config.get("hotkey", "ctrl+alt+j")), self._on_hotkey)
         self.ui = MainWindow(self)
 
@@ -107,13 +130,29 @@ class JarvisApp:
         self.ui.post("voice_available", False)
         for error in self.config.load_errors:
             self.ui.post("error", error, "")
+        self.ui.post("dnd", bool(self.config.get("proactive.dnd", False)))
+        self._restore_history()
         self._refresh_state()
         threading.Thread(target=self._agent_worker, name="agent", daemon=True).start()
         threading.Thread(target=self._load_voice, name="loader", daemon=True).start()
         threading.Thread(target=self._check_backend, args=(self.backend_name,), name="check", daemon=True).start()
         if not self.hotkey.start():
             self.ui.post("error", f"Глобальная горячая клавиша не работает: {self.hotkey.error}", "")
+        self.scheduler.start()
+        self.proactive.start()
         self.ui.mainloop()
+
+    def _restore_history(self) -> None:
+        """Разговор продолжается после перезапуска (memory.save_history)."""
+        if not self.config.get("memory.save_history", True):
+            return
+        history = self.history_store.load()
+        if not history:
+            return
+        self.agent.history = history
+        shown = [(m["role"], m["content"]) for m in history
+                 if m["role"] in ("user", "assistant") and (m.get("content") or "").strip()]
+        self.ui.post("history", shown[-16:])
 
     def shutdown(self) -> None:
         if self._closing:
@@ -122,6 +161,8 @@ class JarvisApp:
         self.stop()
         self._requests.put(None)
         self.hotkey.stop()
+        self.scheduler.stop()
+        self.proactive.stop()
         self.listener.shutdown()
         for timer in self.services.timers:
             timer.cancel()
@@ -252,10 +293,16 @@ class JarvisApp:
             # Подтверждение — только кнопками: случайная фраза не должна ни подтвердить, ни отменить действие.
             self.ui.post("system", "Сначала ответьте «Да» или «Нет» в окне подтверждения (или нажмите «Стоп»).")
             return
+        if self._answer_by_words(text):
+            return
         self.stop(keep_listening=True)  # новый запрос прерывает текущий
+        self._enqueue(text, source)
+
+    def _enqueue(self, text: str, source: str, show: str | None = None) -> None:
+        """Запрос в очередь агента (без прерывания текущего — для расписания и предложений)."""
         request_id = next(self._request_ids)
         cancel = threading.Event()
-        self.ui.post("user", request_id, text, source)
+        self.ui.post("user", request_id, show or text, source)
         self._requests.put((request_id, text, cancel))
 
     def stop(self, keep_listening: bool = False) -> None:
@@ -315,8 +362,9 @@ class JarvisApp:
     def new_dialog(self) -> None:
         self.stop()
         self.agent.reset()
+        self.history_store.clear()
         self.ui.post("clear")
-        self.ui.post("system", "Новый диалог: история очищена.")
+        self.ui.post("system", "Новый диалог: история очищена. То, что я запомнил о вас, осталось — «Настройки → Память».")
 
     # ─── настройки ───
     def list_microphones(self) -> list[dict]:
@@ -336,6 +384,8 @@ class JarvisApp:
         if "tools.allow_powershell" in changes:
             self.ui.post("system", "Команды PowerShell разрешены — каждую нужно будет подтвердить."
                          if changes["tools.allow_powershell"] else "Команды PowerShell запрещены.")
+        if "ui.hud" in changes:
+            self.ui.post("call", self.ui.set_hud, bool(changes["ui.hud"]))
         if "tools.allow_code" in changes:
             self.ui.post("system", "Запуск кода Python разрешён — каждый запуск нужно будет подтвердить."
                          if changes["tools.allow_code"] else "Запуск кода запрещён (писать код в файлы Джарвис может).")
@@ -430,6 +480,8 @@ class JarvisApp:
                 self._current = None
                 self._agent_state = "idle"
                 self._refresh_state()
+                if self.config.get("memory.save_history", True):
+                    self.history_store.save(self.agent.history)
 
     def _speak(self, text: str, cancel: threading.Event | None = None) -> None:
         if self.speak_enabled and self.speaker.available and not (cancel and cancel.is_set()):
@@ -460,14 +512,26 @@ class JarvisApp:
         self.ui.post("assistant_break", current[0])
 
     def on_tool_start(self, call: ToolCall) -> None:
-        arguments = json.dumps(call.arguments, ensure_ascii=False)
-        if len(arguments) > 300:
-            arguments = arguments[:300] + "…"
-        self.ui.post("log_start", datetime.now().strftime("%H:%M:%S"), call.name, arguments)
+        self._log_start(call.id, call.name, call.arguments)
 
     def on_tool_result(self, call: ToolCall, result: ToolResult) -> None:
+        self._log_result(call.id, result)
+
+    def _log_start(self, log_id: str, name: str, arguments: dict) -> None:
+        text = json.dumps(arguments, ensure_ascii=False)
+        if len(text) > 300:
+            text = text[:300] + "…"
+        self.ui.post("log_start", log_id, datetime.now().strftime("%H:%M:%S"), name, text)
+
+    def _log_result(self, log_id: str, result: ToolResult) -> None:
         text = result.text if len(result.text) <= 600 else result.text[:600] + "…"
-        self.ui.post("log_result", result.status, text)
+        self.ui.post("log_result", log_id, result.status, text)
+
+    def _on_nested_step(self, name: str, arguments: dict, result: ToolResult) -> None:
+        """Шаг сценария, запущенного моделью, — отдельной карточкой в журнале."""
+        log_id = f"step-{next(self._log_ids)}"
+        self._log_start(log_id, name, arguments)
+        self._log_result(log_id, result)
 
     def on_error(self, message: str, hint: str = "") -> None:
         self.ui.post("error", message, hint)
@@ -492,7 +556,96 @@ class JarvisApp:
     def notify(self, title: str, text: str) -> None:
         winapi.show_toast(f"Джарвис — {title}", text)
         self.ui.post("system", f"⏰ {text}")
+        self.proactive.note_event(text)
         self._speak(text)
+
+    # ═══ контекст, расписание, проактивность ═══
+    def _context_text(self) -> str:
+        """Активное окно пользователя — чтобы понимать «исправь это», «что тут»."""
+        if not winapi.IS_WINDOWS or not self.config.get("context.active_window", True):
+            return ""
+        hwnd = self.focus.target()
+        title = winapi.window_title(hwnd).strip() if hwnd else ""
+        if not title:
+            return ""
+        try:
+            process = psutil.Process(winapi.window_pid(hwnd)).name()
+        except psutil.Error:
+            process = ""
+        return f"активное окно пользователя: «{title[:120]}»" + (f" ({process})" if process else "")
+
+    def _on_schedule_due(self, task: dict) -> None:  # поток scheduler
+        what = f"сценарий «{task['routine']}»" if task.get("routine") else f"«{task.get('prompt')}»"
+        self.ui.post("system", f"⏰ По расписанию «{task['name']}»: {what}.")
+        self.proactive.note_event(f"по расписанию «{task['name']}»")
+        if task.get("routine"):
+            self._enqueue(f"запусти сценарий {task['routine']}", "schedule")
+        else:
+            self._enqueue(task["prompt"], "schedule")
+
+    def _quiet_now(self) -> bool:
+        return self.proactive.quiet(datetime.now())
+
+    def _deliver_suggestion(self, suggestion: Suggestion) -> None:  # поток proactive
+        self._suggestions[suggestion.id] = suggestion
+        self._pending_suggestion = (suggestion, time.monotonic())
+        self.ui.post("suggestion", suggestion)
+        if self.speak_enabled and self.speaker.available and not self._quiet_now():
+            self.speaker.earcon("start")
+            self.speaker.say(suggestion.text)
+            # Ответить можно голосом («да» / «нет») — сразу после вопроса Джарвис слушает.
+            self._listen_after_speech = self.listener.available
+
+    def answer_suggestion(self, suggestion_id: str, answer: str) -> None:
+        """answer: yes / later / never — кнопки карточки или голос."""
+        suggestion = self._suggestions.pop(suggestion_id, None)
+        if suggestion is None:
+            return
+        if self._pending_suggestion and self._pending_suggestion[0].id == suggestion_id:
+            self._pending_suggestion = None
+        self.proactive.feedback(suggestion.kind, answer)
+        self.ui.post("suggestion_answered", suggestion_id, answer)
+        if answer == "yes":
+            self._enqueue(suggestion.prompt, "suggestion", show="Да, давай")
+        elif answer == "never":
+            self.ui.post("system", "Хорошо, сэр, такое больше не предлагаю (вернуть — «Настройки → Память → "
+                                   "Снова предлагать всё»).")
+
+    def _answer_by_words(self, text: str) -> bool:
+        """«Да» / «нет» сразу после предложения Джарвиса — ответ на него."""
+        pending = self._pending_suggestion
+        if pending is None or time.monotonic() - pending[1] > SUGGESTION_ANSWER_SECONDS:
+            return False
+        words = normalize(text)
+        found, rest = find_wake_word(words, self.config.get("voice.wake_words", ["джарвис"]))
+        words = rest if found else words
+        answer = suggestion_answer(words)
+        if answer:
+            self.answer_suggestion(pending[0].id, answer)
+            return True
+        self._pending_suggestion = None  # ответил чем-то другим — это новый запрос
+        return False
+
+    def _auto_briefing(self) -> None:  # поток proactive
+        from .briefing import compose
+
+        text = compose(self.services)
+        self.ui.post("jarvis_note", "Утренний брифинг", text)
+        if self.speak_enabled and self.speaker.available and not self._quiet_now():
+            self.speaker.say(text)
+
+    def briefing_now(self) -> None:
+        threading.Thread(target=self._auto_briefing, name="briefing", daemon=True).start()
+
+    def _on_user_return(self, summary: str) -> None:  # поток proactive
+        self.ui.post("jarvis_note", "С возвращением", summary)
+        if self.speak_enabled and self.speaker.available and not self._quiet_now():
+            self.speaker.say("С возвращением, сэр. Пока вас не было, кое-что произошло — подробности в окне.")
+
+    def set_dnd(self, enabled: bool) -> None:
+        self.config.set("proactive.dnd", enabled, persist=True)
+        self.ui.post("system", "Режим «Не беспокоить»: предложений не будет." if enabled
+                     else "Режим «Не беспокоить» выключен: буду предлагать помощь, когда замечу что-то важное.")
 
     # ═══ голос ═══
     def _on_hotkey(self) -> None:  # поток hotkey
@@ -560,6 +713,9 @@ class JarvisApp:
         self._speaking = speaking
         if not speaking and self.jarvis_mode:
             self.listener.reset()
+        if not speaking and self._listen_after_speech:
+            self._listen_after_speech = False
+            self.listener.listen_command(float(self.config.get("voice.follow_up_seconds", 6)))
         self._refresh_state()
 
     def _on_voice_error(self, message: str, hint: str = "") -> None:
