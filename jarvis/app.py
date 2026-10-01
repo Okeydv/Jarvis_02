@@ -21,13 +21,16 @@ from .config import Config
 from .hotkey import GlobalHotkey
 from .llm import BACKEND_TITLES, LLMBackend, LLMError, create_backend
 from .llm.base import ToolCall
-from .stt import Listener, VoiceError
-from .text_utils import SentenceSplitter, contains_stop_word, find_wake_word, is_stop_phrase
+from .stt import Listener, VoiceError, list_input_devices
+from .text_utils import SentenceSplitter, contains_stop_word, find_wake_word, is_stop_phrase, normalize
 from .tools import Confirmation, ToolRegistry, ToolResult, ToolServices
 from .tts import Speaker, SpeechError
 from .ui import MainWindow
 
 log = logging.getLogger(__name__)
+
+# Какой бэкенд использует ключ из .env
+_SECRET_BACKENDS = {"GIGACHAT_CREDENTIALS": "gigachat", "GEMINI_API_KEY": "gemini", "BAZAARLINK_API_KEY": "qwen"}
 
 
 class ConfirmRequest:
@@ -68,7 +71,7 @@ class JarvisApp:
         self.config = config
         self.focus = winapi.FocusTracker()
         self.speak_enabled = bool(config.get("voice.speak_replies", True))
-        self.jarvis_mode = bool(config.get("voice.jarvis_mode", False))
+        self.jarvis_mode = bool(config.get("voice.jarvis_mode", True))
         self.backend_name = str(config.get("llm.backend", "ollama"))
 
         self._backends: dict[str, LLMBackend] = {}
@@ -83,17 +86,19 @@ class JarvisApp:
         self._loading = True
         self._loading_text = ""
         self._listening = False
+        self._wake_until = 0.0
         self._speaking = False
         self._closing = False
 
-        self.ui = MainWindow(self)
         self.speaker = Speaker(config, on_speaking=self._on_speaking, on_error=self._on_voice_error)
         self.listener = Listener(config, on_partial=self._on_partial, on_final=self._on_final,
-                                 on_listening=self._on_listening, on_error=self._on_voice_error)
+                                 on_listening=self._on_listening, on_error=self._on_voice_error,
+                                 on_wake=self._on_wake, on_device=self._on_device)
         self.services = ToolServices(config, confirm=self.ask_confirmation, notify=self.notify, focus=self.focus)
         self.registry = ToolRegistry(self.services)
         self.agent = Agent(config, self.registry, self._backend, self)
         self.hotkey = GlobalHotkey(str(config.get("hotkey", "ctrl+alt+j")), self._on_hotkey)
+        self.ui = MainWindow(self)
 
     # ═══ запуск и остановка ═══
     def run(self) -> None:
@@ -132,7 +137,7 @@ class JarvisApp:
             return "speaking"
         if self._agent_state == "thinking":
             return "thinking"
-        if self._listening:
+        if self._listening or time.monotonic() < self._wake_until:
             return "listening"
         if self._loading:
             return "loading"
@@ -143,8 +148,13 @@ class JarvisApp:
         subtitle = ""
         if state == "loading":
             subtitle = self._loading_text
-        elif state == "idle" and self.jarvis_mode and self.listener.available:
-            subtitle = "скажите «Джарвис, …»"
+        elif state == "listening":
+            subtitle = "говорите команду"
+        elif state == "idle":
+            if self.jarvis_mode and self.listener.available:
+                subtitle = "скажите «Джарвис, …»"
+            elif self.listener.available:
+                subtitle = f"нажмите «Микрофон» или {str(self.config.get('hotkey', 'ctrl+alt+j')).upper()}"
         self.ui.post("state", state, subtitle)
 
     def _set_loading(self, text: str) -> None:
@@ -156,23 +166,25 @@ class JarvisApp:
         voice_ok = False
         self._set_loading("распознавание речи")
         try:
-            self.listener.load()
+            self.listener.load(status=self._set_loading)
             voice_ok = True
         except VoiceError as exc:
-            self.ui.post("error", exc.message, exc.hint)
+            self.ui.post("error", f"Голосовой ввод не работает: {exc.message}", exc.hint)
         except Exception as exc:
             log.exception("Сбой загрузки Vosk")
             self.ui.post("error", f"Не удалось запустить распознавание речи: {exc}", "")
         if not voice_ok:
-            self.jarvis_mode = False  # без микрофона режим недоступен (в config.yaml не пишем)
+            self.jarvis_mode = False  # без микрофона режим недоступен (настройку не сохраняем)
         self.ui.post("voice_available", voice_ok)
         self.ui.post("settings", self.jarvis_mode, self.speak_enabled)
+        if voice_ok and self.jarvis_mode:
+            self.listener.set_continuous(True)
 
         self._set_loading("синтез речи")
         try:
             self.speaker.load(status=self._set_loading)
         except SpeechError as exc:
-            self.ui.post("error", exc.message, exc.hint)
+            self.ui.post("error", f"Озвучка ответов не работает: {exc.message}", exc.hint)
         except Exception as exc:
             log.exception("Сбой загрузки Silero")
             self.ui.post("error", f"Не удалось запустить синтез речи: {exc}", "")
@@ -180,14 +192,12 @@ class JarvisApp:
         self._loading = False
         combo = str(self.config.get("hotkey", "ctrl+alt+j")).upper()
         if voice_ok and self.jarvis_mode:
-            self.listener.set_continuous(True)
-        if voice_ok:
-            self.ui.post("system", f"Джарвис готов. Нажмите {combo} или «Микрофон» и говорите, либо напишите команду. "
-                                   "В режиме «Джарвис» начинайте фразу со слова «Джарвис».")
+            self.ui.post("system", f"Джарвис готов и слушает. Скажите «Джарвис, открой браузер» — или нажмите {combo}, "
+                                   "или напишите команду.")
+        elif voice_ok:
+            self.ui.post("system", f"Джарвис готов. Нажмите «Микрофон» или {combo} и говорите, либо напишите команду.")
         else:
             self.ui.post("system", "Джарвис готов к текстовым командам.")
-        if not self.speaker.available:
-            self.ui.post("system", "Озвучка ответов недоступна — ответы будут только в чате.")
         self._refresh_state()
 
     # ═══ бэкенды ═══
@@ -212,7 +222,8 @@ class JarvisApp:
             backend = self._get_backend(name)
             backend.check()
             if name == self.backend_name:
-                self.ui.post("system", f"{BACKEND_TITLES[name]}: модель {backend.model} на связи.")
+                self.ui.post("system", f"{BACKEND_TITLES[name]}: модель {backend.model} на связи. "
+                                       f"Инструментов управления ПК: {len(self.registry.schemas())}.")
             system = str(self.config.get("system_prompt") or "").strip()
             backend.warmup(system, self.registry.schemas())
         except LLMError as exc:
@@ -222,6 +233,12 @@ class JarvisApp:
             log.exception("Проверка бэкенда %s", name)
             if name == self.backend_name:
                 self.ui.post("error", f"{BACKEND_TITLES.get(name, name)}: {type(exc).__name__}: {exc}", "")
+
+    def _drop_backend(self, name: str) -> None:
+        with self._backend_lock:
+            backend = self._backends.pop(name, None)
+        if backend is not None:
+            backend.close()
 
     # ═══ действия из окна ═══
     def submit_text(self, text: str, source: str = "text") -> None:
@@ -252,12 +269,14 @@ class JarvisApp:
         self.speaker.stop()
         if not keep_listening:
             self.listener.cancel_command()
+            self._wake_until = 0.0
         self._refresh_state()
 
     def toggle_mic(self) -> None:
         if not self.listener.available:
             self.ui.post("error", "Голосовой ввод недоступен.",
-                         "Нужны модель Vosk (python download_models.py) и микрофон. Текстовый режим работает.")
+                         "Нужны модель Vosk и микрофон — подробности в сообщении при запуске и в «Настройки → "
+                         "Диагностика». Текстовый режим работает.")
             return
         if self.listener.command_active:
             self.listener.cancel_command()
@@ -269,13 +288,13 @@ class JarvisApp:
     def set_jarvis_mode(self, enabled: bool) -> None:
         if enabled and not self.listener.available:
             self.ui.post("settings", False, self.speak_enabled)
-            self.ui.post("error", "Режим «Джарвис» недоступен без микрофона и модели Vosk.", "")
+            self.ui.post("error", "Режим «Джарвис» недоступен без микрофона и модели распознавания речи.", "")
             return
         self.jarvis_mode = enabled
         self.config.set("voice.jarvis_mode", enabled, persist=True)
         self.listener.set_continuous(enabled)
         self.ui.post("system", "Режим «Джарвис» включён: начинайте команду со слова «Джарвис»." if enabled
-                     else "Режим «Джарвис» выключен.")
+                     else "Режим «Джарвис» выключен: для голосовой команды нажмите «Микрофон».")
         self._refresh_state()
 
     def set_speak(self, enabled: bool) -> None:
@@ -290,7 +309,7 @@ class JarvisApp:
         self.backend_name = name
         self.config.set("llm.backend", name, persist=True)
         self.ui.post("backend", name, self._model_name(name))
-        self.ui.post("system", f"Бэкенд: {BACKEND_TITLES.get(name, name)} ({self._model_name(name)}).")
+        self.ui.post("system", f"Модель: {BACKEND_TITLES.get(name, name)} ({self._model_name(name)}).")
         threading.Thread(target=self._check_backend, args=(name,), name="check", daemon=True).start()
 
     def new_dialog(self) -> None:
@@ -298,6 +317,81 @@ class JarvisApp:
         self.agent.reset()
         self.ui.post("clear")
         self.ui.post("system", "Новый диалог: история очищена.")
+
+    # ─── настройки ───
+    def list_microphones(self) -> list[dict]:
+        return list_input_devices()
+
+    def apply_settings(self, changes: dict) -> None:
+        """Применяет и сохраняет настройки из окна «Настройки»."""
+        for key, value in changes.items():
+            self.config.set(key, value, persist=True)
+        if {"voice.input_device"} & changes.keys():
+            self.listener.restart()
+        if "tts.speaker" in changes:
+            self.speaker.set_voice(str(changes["tts.speaker"]))
+        for backend in BACKEND_TITLES:
+            if any(key.startswith(backend + ".") for key in changes):
+                self._reset_backend(backend)
+        if "tools.allow_powershell" in changes:
+            self.ui.post("system", "Команды PowerShell разрешены — каждую нужно будет подтвердить."
+                         if changes["tools.allow_powershell"] else "Команды PowerShell запрещены.")
+        log.info("Настройки изменены: %s", ", ".join(changes))
+
+    def save_secrets(self, secrets: dict[str, str]) -> None:
+        """Ключи API из окна «Настройки» → файл .env; бэкенд пересоздаётся с новым ключом."""
+        for name, value in secrets.items():
+            try:
+                self.config.save_secret(name, value)
+            except Exception as exc:
+                log.exception("Не удалось сохранить ключ %s", name)
+                self.ui.post("error", f"Не удалось сохранить ключ {name} в файл .env: {exc}", "")
+                return
+        for name in secrets:
+            backend = _SECRET_BACKENDS.get(name)
+            if not backend:
+                continue
+            title = BACKEND_TITLES.get(backend, backend)
+            if backend == self.backend_name:
+                self.ui.post("system", f"Ключ {title} сохранён — проверяю связь с моделью…")
+            else:
+                self.ui.post("system", f"Ключ {title} сохранён. Чтобы им пользоваться, выберите «{title}» "
+                                       "вверху окна.")
+            self._reset_backend(backend)
+        log.info("Сохранены ключи: %s", ", ".join(secrets))
+
+    def _reset_backend(self, name: str) -> None:
+        self._drop_backend(name)
+        if name == self.backend_name:
+            self.ui.post("backend", name, self._model_name(name))
+            threading.Thread(target=self._check_backend, args=(name,), name="check", daemon=True).start()
+
+    def preview_voice(self, name: str) -> None:
+        if not self.speaker.available:
+            self.ui.post("error", "Синтез речи ещё не загружен.", "")
+            return
+        self.speaker.stop()
+        self.speaker.set_voice(name)
+        self.speaker.say("Добрый день, сэр. Так звучит мой голос.")
+
+    def self_test_tools(self) -> list[str]:
+        from .diagnostics import tools_self_test
+
+        return tools_self_test(self.registry)
+
+    def run_diagnostics(self, emit) -> str:
+        from .diagnostics import run_diagnostics
+
+        extra = [("✓ Горячая клавиша " + str(self.config.get("hotkey", "")).upper() + " работает") if not self.hotkey.error
+                 else f"✗ Горячая клавиша: {self.hotkey.error}"]
+        backend = None
+        try:
+            backend = self._backend()
+        except LLMError:
+            pass
+        return run_diagnostics(self.config, emit, listener=self.listener, speaker=self.speaker,
+                               registry=self.registry, backend=backend, play=False,
+                               prompt=lambda message: emit(">>> " + message), extra=extra)
 
     # ═══ агент ═══
     def _agent_worker(self) -> None:
@@ -401,11 +495,21 @@ class JarvisApp:
     def _on_hotkey(self) -> None:  # поток hotkey
         self.toggle_mic()
 
+    def _on_device(self, name: str) -> None:
+        self.ui.post("mic_device", name)
+
     def _on_listening(self, active: bool) -> None:
         self._listening = active
         self.ui.post("mic", active)
         if not active:
             self.ui.post("heard", "")
+        self._refresh_state()
+
+    def _on_wake(self) -> None:
+        """«Джарвис» прозвучал в начале фразы — сразу показываем, что слушаем команду."""
+        if self._speaking or self.speaker.busy:
+            return
+        self._wake_until = time.monotonic() + float(self.config.get("voice.max_phrase_seconds", 15))
         self._refresh_state()
 
     def _on_partial(self, text: str) -> None:
@@ -416,20 +520,30 @@ class JarvisApp:
             self.stop()
             self.listener.reset()
 
-    def _on_final(self, text: str, mode: str) -> None:
+    def _on_final(self, text: str, mode: str, wake_heard: bool = False) -> None:
         self.ui.post("heard", "")
+        self._wake_until = 0.0
         if mode == "command":
             self.submit_text(text, "voice")
+            self._refresh_state()
             return
         # Режим «Джарвис». Микрофон слышит и голос самого Джарвиса, поэтому во время речи
         # фразы, похожие на только что сказанное, отбрасываются как эхо.
         speaking = self._speaking or self.speaker.busy
         if speaking and self.speaker.is_echo(text):
+            self._refresh_state()
             return
-        found, command = find_wake_word(text, self.config.get("voice.wake_words", ["джарвис"]))
+        wake_words = self.config.get("voice.wake_words", ["джарвис"])
+        found, command = find_wake_word(text, wake_words)
+        if not found and wake_heard and not speaking:
+            # «Джарвис» был в промежуточном результате, но в итоговом распознался иначе:
+            # считаем первое слово обращением.
+            words = normalize(text).split()
+            found, command = bool(words), " ".join(words[1:])
         if not found:
             if speaking and contains_stop_word(text, self.config.get("voice.stop_words", [])):
                 self.stop()
+            self._refresh_state()
             return
         if command:
             self.submit_text(command, "voice")  # прерывает текущий ответ
@@ -437,6 +551,7 @@ class JarvisApp:
             self.stop(keep_listening=True)
             self.listener.listen_command(float(self.config.get("voice.follow_up_seconds", 6)))
             self.speaker.earcon("start")
+        self._refresh_state()
 
     def _on_speaking(self, speaking: bool) -> None:
         self._speaking = speaking

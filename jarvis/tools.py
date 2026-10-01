@@ -719,6 +719,51 @@ def open_folder(ctx: CallContext, path: str) -> str:
     raise ToolError(f"папка не найдена: {target}")
 
 
+def _folder_path(path: str) -> Path:
+    """Путь папки для создания/просмотра; просто имя — на рабочем столе."""
+    target = resolve_folder(path)
+    if isinstance(target, str):
+        raise ToolError(f"«{path}» — системная папка, её можно только открыть")
+    if not target.is_absolute():
+        target = winapi.known_folder("Desktop") / target
+    return target
+
+
+@tool(
+    "create_folder",
+    "Создать папку. Понимает «Рабочий стол\\Проекты», «Документы\\Отчёты» или полный путь; "
+    "если указано только имя — папка создаётся на рабочем столе.",
+    {"path": {"type": "string", "description": "Путь или имя новой папки"}},
+    required=("path",),
+)
+def create_folder(ctx: CallContext, path: str) -> str:
+    target = _folder_path(path)
+    if target.is_dir():
+        return f"Папка уже существует: {target}"
+    target.mkdir(parents=True)
+    return f"Папка создана: {target}"
+
+
+@tool(
+    "list_folder",
+    "Показать, что лежит в папке (имена папок и файлов). Понимает «Загрузки», «Документы», "
+    "«Рабочий стол», вложенные и полные пути.",
+    {"path": {"type": "string", "description": "Название известной папки или полный путь"}},
+    required=("path",),
+)
+def list_folder(ctx: CallContext, path: str) -> str:
+    target = _folder_path(path)
+    if not target.is_dir():
+        raise ToolError(f"папка не найдена: {target}")
+    entries = sorted(target.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
+    entries = [e for e in entries if not e.name.startswith(".") and e.name.lower() != "desktop.ini"]
+    if not entries:
+        return f"Папка {target} пуста."
+    shown = [f"{e.name}{'/' if e.is_dir() else ''}" for e in entries[:40]]
+    more = f" … и ещё {len(entries) - 40}" if len(entries) > 40 else ""
+    return f"В папке {target} ({len(entries)} шт.): " + ", ".join(shown) + more
+
+
 _com_state = threading.local()
 
 
@@ -734,14 +779,17 @@ def _endpoint_volume():
         _com_state.ready = True
     from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
-    speakers = AudioUtilities.GetSpeakers()
-    volume = getattr(speakers, "EndpointVolume", None)
-    if volume is not None:
-        return volume
-    from ctypes import POINTER, cast
+    try:
+        speakers = AudioUtilities.GetSpeakers()
+        volume = getattr(speakers, "EndpointVolume", None)
+        if volume is not None:
+            return volume
+        from ctypes import POINTER, cast
 
-    interface = speakers.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None)
-    return cast(interface, POINTER(IAudioEndpointVolume))
+        interface = speakers.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None)
+        return cast(interface, POINTER(IAudioEndpointVolume))
+    except Exception as exc:
+        raise ToolError(f"не найдено устройство вывода звука (динамики или наушники): {exc}") from None
 
 
 @tool(
@@ -759,6 +807,24 @@ def set_volume(ctx: CallContext, level: int) -> str:
 
 
 @tool(
+    "change_volume",
+    "Сделать громче или тише на указанное число процентов (например +10 или −20). "
+    "Используй для просьб «погромче», «потише».",
+    {"delta": {"type": "integer", "description": "Изменение громкости в процентах, от −100 до 100",
+               "minimum": -100, "maximum": 100}},
+    required=("delta",),
+)
+def change_volume(ctx: CallContext, delta: int) -> str:
+    volume = _endpoint_volume()
+    current = round(volume.GetMasterVolumeLevelScalar() * 100)
+    level = max(0, min(100, current + delta))
+    volume.SetMasterVolumeLevelScalar(level / 100.0, None)
+    if level > 0 and volume.GetMute():
+        volume.SetMute(0, None)
+    return f"Громкость: было {current}%, стало {level}%."
+
+
+@tool(
     "mute",
     "Выключить или включить звук компьютера. on=true — выключить звук (режим «без звука»), "
     "on=false — снова включить звук.",
@@ -768,6 +834,69 @@ def set_volume(ctx: CallContext, level: int) -> str:
 def mute(ctx: CallContext, on: bool) -> str:
     _endpoint_volume().SetMute(1 if on else 0, None)
     return "Звук выключен." if on else "Звук включён."
+
+
+@tool(
+    "set_brightness",
+    "Установить яркость экрана в процентах (работает на ноутбуках и мониторах с поддержкой управления яркостью).",
+    {"level": {"type": "integer", "description": "Яркость от 0 до 100", "minimum": 0, "maximum": 100}},
+    required=("level",),
+)
+def set_brightness(ctx: CallContext, level: int) -> str:
+    winapi._require_windows()
+    script = ("Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop | "
+              f"Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{{Timeout=1; Brightness={level}}} "
+              "-ErrorAction Stop | Out-Null")
+    result = winapi.run_powershell(script, timeout=20)
+    if result.returncode != 0:
+        raise ToolError("яркость этого экрана нельзя изменить программно (обычно это получается только на "
+                        "ноутбуках). Можно открыть параметры экрана: open_settings(«экран»).")
+    return f"Яркость экрана: {level}%."
+
+
+_SETTINGS_PAGES = {
+    "главная": "ms-settings:", "параметры": "ms-settings:", "настройки": "ms-settings:",
+    "экран": "ms-settings:display", "дисплей": "ms-settings:display", "яркость": "ms-settings:display",
+    "ночной свет": "ms-settings:nightlight",
+    "звук": "ms-settings:sound", "звуковые устройства": "ms-settings:sound-devices",
+    "микрофон": "ms-settings:privacy-microphone", "доступ к микрофону": "ms-settings:privacy-microphone",
+    "камера": "ms-settings:privacy-webcam",
+    "bluetooth": "ms-settings:bluetooth", "блютуз": "ms-settings:bluetooth", "устройства": "ms-settings:bluetooth",
+    "wi fi": "ms-settings:network-wifi", "wifi": "ms-settings:network-wifi", "вай фай": "ms-settings:network-wifi",
+    "сеть": "ms-settings:network-status", "интернет": "ms-settings:network-status", "vpn": "ms-settings:network-vpn",
+    "приложения": "ms-settings:appsfeatures", "автозагрузка": "ms-settings:startupapps",
+    "приложения по умолчанию": "ms-settings:defaultapps",
+    "питание": "ms-settings:powersleep", "электропитание": "ms-settings:powersleep", "батарея": "ms-settings:batterysaver",
+    "обновления": "ms-settings:windowsupdate", "обновление windows": "ms-settings:windowsupdate",
+    "персонализация": "ms-settings:personalization", "обои": "ms-settings:personalization-background",
+    "фон": "ms-settings:personalization-background", "темы": "ms-settings:themes", "цвета": "ms-settings:personalization-colors",
+    "уведомления": "ms-settings:notifications", "дата и время": "ms-settings:dateandtime", "время": "ms-settings:dateandtime",
+    "язык": "ms-settings:regionlanguage", "клавиатура": "ms-settings:typing", "мышь": "ms-settings:mousetouchpad",
+    "сенсорная панель": "ms-settings:devices-touchpad", "принтеры": "ms-settings:printers",
+    "память": "ms-settings:storagesense", "хранилище": "ms-settings:storagesense", "диск": "ms-settings:storagesense",
+    "учетные записи": "ms-settings:yourinfo", "конфиденциальность": "ms-settings:privacy",
+    "о системе": "ms-settings:about", "система": "ms-settings:about",
+    "специальные возможности": "ms-settings:easeofaccess", "игровой режим": "ms-settings:gaming-gamemode",
+}
+
+
+@tool(
+    "open_settings",
+    "Открыть раздел параметров Windows: «экран», «звук», «bluetooth», «wi-fi», «сеть», «приложения», "
+    "«автозагрузка», «питание», «обновления», «обои», «уведомления», «дата и время», «язык», «мышь», "
+    "«принтеры», «память», «микрофон», «о системе» и т. п.",
+    {"page": {"type": "string", "description": "Название раздела параметров"}},
+    required=("page",),
+)
+def open_settings(ctx: CallContext, page: str) -> str:
+    winapi._require_windows()
+    key = normalize(page)
+    uri = page.strip() if page.strip().lower().startswith("ms-settings:") else _SETTINGS_PAGES.get(key)
+    if uri is None:
+        best = max(_SETTINGS_PAGES, key=lambda name: similarity(key, name))
+        uri = _SETTINGS_PAGES[best] if similarity(key, best) >= 0.75 else "ms-settings:"
+    os.startfile(uri)  # type: ignore[attr-defined]
+    return f"Открыл параметры Windows ({uri})."
 
 
 _MEDIA_KEYS = {

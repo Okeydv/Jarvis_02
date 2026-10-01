@@ -94,11 +94,24 @@ class GeminiBackend(LLMBackend):
                     add("user", [types.Part(text=f"[Результат {message.get('name')}]: {message['content']}")])
         return contents
 
+    @staticmethod
+    def gemini_parameters(parameters: dict) -> dict:
+        """Gemini отклоняет объект с пустыми properties («should be non-empty for OBJECT type»),
+        поэтому функциям без параметров даём один необязательный параметр. Реестр
+        инструментов лишние аргументы игнорирует."""
+        if parameters.get("properties"):
+            return parameters
+        return {
+            "type": "object",
+            "properties": {"note": {"type": "string", "description": "Не требуется, можно не передавать."}},
+            "required": [],
+        }
+
     def build_tools(self, tools: list[dict]) -> list:
         types = self.types
         declarations = [
             types.FunctionDeclaration(name=t["name"], description=t["description"],
-                                      parameters_json_schema=t["parameters"])
+                                      parameters=self.gemini_parameters(t["parameters"]))
             for t in tools
         ]
         return [types.Tool(function_declarations=declarations)]

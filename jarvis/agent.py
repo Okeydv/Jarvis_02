@@ -92,6 +92,9 @@ class Agent:
             outcome.failed = True
             return outcome
         tools = self.registry.schemas()
+        if any(t["name"] == "run_powershell" for t in tools):
+            system += ("\nДля задач на компьютере, для которых нет отдельного инструмента, используй "
+                       "run_powershell — пользователь подтверждает каждую команду.")
 
         for step in range(max_steps):
             if cancel.is_set():

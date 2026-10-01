@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .base import AssistantTurn, LLMBackend, LLMError, ToolCall
 
-BACKEND_TITLES = {"ollama": "Ollama", "gigachat": "GigaChat", "gemini": "Gemini"}
+BACKEND_TITLES = {"ollama": "Ollama", "gigachat": "GigaChat", "gemini": "Gemini", "qwen": "Qwen"}
 
 
 def create_backend(name: str, config) -> LLMBackend:
@@ -21,7 +21,11 @@ def create_backend(name: str, config) -> LLMBackend:
         from .gemini_backend import GeminiBackend
 
         return GeminiBackend(config)
-    raise LLMError(f"Неизвестный бэкенд «{name}».", "Допустимые значения llm.backend: ollama, gigachat, gemini.")
+    if name == "qwen":
+        from .qwen_backend import QwenBackend
+
+        return QwenBackend(config)
+    raise LLMError(f"Неизвестный бэкенд «{name}».", "Допустимые значения llm.backend: ollama, gigachat, gemini, qwen.")
 
 
 __all__ = ["AssistantTurn", "BACKEND_TITLES", "LLMBackend", "LLMError", "ToolCall", "create_backend"]

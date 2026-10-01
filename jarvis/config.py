@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
-import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -17,13 +17,25 @@ log = logging.getLogger(__name__)
 ROOT_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT_DIR / "config.yaml"
 ENV_PATH = ROOT_DIR / ".env"
+# Всё, что меняется в окне программы, сохраняется сюда (а config.yaml остаётся нетронутым,
+# поэтому обновление через git pull не конфликтует с вашими настройками).
+USER_SETTINGS_PATH = ROOT_DIR / "user_settings.json"
 
-BACKENDS = ("ollama", "gigachat", "gemini")
+BACKENDS = ("ollama", "gigachat", "gemini", "qwen")
 
 DEFAULT_SYSTEM_PROMPT = (
     "Ты — Джарвис, ИИ-ассистент, управляющий компьютером пользователя. Отвечай по-русски, "
     "коротко, обращайся “сэр”, лёгкая британская ирония. Для действий с ПК используй "
-    "инструменты; не говори, что действие выполнено, если не вызвал инструмент."
+    "инструменты; не говори, что действие выполнено, если не вызвал инструмент.\n"
+    "У тебя есть доступ к этому компьютеру через инструменты: программы, сайты и поиск, папки, "
+    "громкость и яркость, музыка, ввод текста и сочетания клавиш, скриншоты, таймеры, заметки, "
+    "параметры Windows, блокировка, сон и выключение. Если просьбу можно выполнить инструментом — "
+    "сразу вызывай его, а не объясняй, как сделать вручную. Никогда не говори, что у тебя нет "
+    "доступа к компьютеру.\n"
+    "Пользователь обычно говорит голосом: его речь распознаётся и приходит тебе текстом, возможны "
+    "ошибки распознавания — угадывай смысл. Ответ будет озвучен, поэтому пиши обычным текстом без "
+    "markdown, списков и эмодзи.\n"
+    "Если инструмент вернул ошибку или пользователь отменил действие — честно скажи об этом."
 )
 
 # Значения по умолчанию: используются, если в config.yaml чего-то нет.
@@ -51,11 +63,21 @@ DEFAULTS: dict[str, Any] = {
         "temperature": None,
         "proxy": "",
     },
+    "qwen": {
+        "base_url": "https://api.bazaarlink.ai/v1",
+        "model": "qwen/qwen3.7-flash:free",
+        "temperature": 0.4,
+        "thinking": False,
+        "free_fallback": False,
+        "proxy": "",
+    },
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "voice": {
         "vosk_model_path": "models/vosk-model-small-ru-0.22",
+        "vosk_model_url": "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip",
         "input_device": None,
-        "jarvis_mode": False,
+        "input_gain": 1.0,
+        "jarvis_mode": True,
         "speak_replies": True,
         "wake_words": ["джарвис", "джервис", "жарвис", "джарвиз"],
         "stop_words": ["стоп", "хватит", "замолчи", "замолкни", "остановись", "довольно"],
@@ -100,9 +122,13 @@ def deep_merge(base: dict, override: dict) -> dict:
 class Config:
     """Настройки с доступом по «точечному» пути: cfg.get("ollama.model")."""
 
-    def __init__(self, data: dict, path: Path | None = None, errors: list[str] | None = None):
+    def __init__(self, data: dict, path: Path | None = None, errors: list[str] | None = None,
+                 user_path: Path | None = None, user_data: dict | None = None, env_path: Path = ENV_PATH):
         self.data = data
         self.path = path
+        self.env_path = env_path
+        self.user_path = user_path
+        self.user_data: dict = user_data or {}
         self.load_errors = errors or []
         self._lock = threading.Lock()
 
@@ -119,22 +145,33 @@ class Config:
         return value if isinstance(value, dict) else {}
 
     def set(self, dotted: str, value: Any, persist: bool = False) -> None:
-        """Меняет значение в памяти и (по желанию) в config.yaml, сохраняя комментарии."""
+        """Меняет значение в памяти и (persist=True) запоминает его в user_settings.json."""
         with self._lock:
             parts = dotted.split(".")
-            node = self.data
-            for part in parts[:-1]:
-                node = node.setdefault(part, {})
-            node[parts[-1]] = value
-            if persist and self.path is not None:
+            _assign(self.data, parts, value)
+            if persist and self.user_path is not None:
+                _assign(self.user_data, parts, value)
                 try:
-                    persist_scalar(self.path, parts, value)
-                except Exception as exc:  # запись настроек не должна ронять программу
-                    log.warning("Не удалось сохранить %s в %s: %s", dotted, self.path, exc)
+                    tmp = self.user_path.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(self.user_data, ensure_ascii=False, indent=2), encoding="utf-8")
+                    os.replace(tmp, self.user_path)
+                except OSError as exc:  # запись настроек не должна ронять программу
+                    log.warning("Не удалось сохранить %s в %s: %s", dotted, self.user_path, exc)
 
     def reload_env(self) -> None:
         """Перечитывает .env — ключ можно добавить, не перезапуская программу."""
-        _load_env(ENV_PATH, override=True)
+        _load_env(self.env_path, override=True)
+
+    def save_secret(self, name: str, value: str) -> None:
+        """Записывает ключ API в .env (файл создаётся при необходимости) и сразу применяет его."""
+        from dotenv import set_key
+
+        value = value.strip()
+        with self._lock:
+            if not self.env_path.exists():
+                self.env_path.write_text("", encoding="utf-8")
+            set_key(str(self.env_path), name, value)
+        os.environ[name] = value
 
     def resolve_path(self, value: str | os.PathLike | None) -> Path | None:
         """Относительные пути считаются от папки программы; %VAR% и ~ раскрываются."""
@@ -144,7 +181,16 @@ class Config:
         return path if path.is_absolute() else ROOT_DIR / path
 
 
-def load_config(path: Path = CONFIG_PATH, env_path: Path = ENV_PATH) -> Config:
+def mask_secret(value: str | None) -> str:
+    """«sk-bl-abcdef123456» → «sk-b…3456» — чтобы показать, что ключ задан, не раскрывая его."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    return f"{value[:4]}…{value[-4:]}" if len(value) > 12 else "••••"
+
+
+def load_config(path: Path = CONFIG_PATH, env_path: Path = ENV_PATH,
+                user_path: Path | None = USER_SETTINGS_PATH) -> Config:
     errors: list[str] = []
     _load_env(env_path)
     raw: dict = {}
@@ -163,13 +209,32 @@ def load_config(path: Path = CONFIG_PATH, env_path: Path = ENV_PATH) -> Config:
     else:
         errors.append(f"Файл настроек {path} не найден — использую значения по умолчанию.")
 
-    data = deep_merge(DEFAULTS, raw)
+    user_data: dict = {}
+    if user_path is not None and user_path.exists():
+        try:
+            user_data = json.loads(user_path.read_text(encoding="utf-8-sig")) or {}
+            if not isinstance(user_data, dict):
+                user_data = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(f"Не удалось прочитать {user_path.name}: {exc}. Настройки окна сброшены.")
+            user_data = {}
+
+    data = deep_merge(deep_merge(DEFAULTS, raw), user_data)
     backend = str(data["llm"].get("backend", "ollama")).strip().lower()
     if backend not in BACKENDS:
         errors.append(f"Неизвестный бэкенд «{backend}» в llm.backend — выбран ollama.")
         backend = "ollama"
     data["llm"]["backend"] = backend
-    return Config(data, path if path.exists() else None, errors)
+    return Config(data, path if path.exists() else None, errors, user_path, user_data, env_path)
+
+
+def _assign(tree: dict, parts: list[str], value: Any) -> None:
+    node = tree
+    for part in parts[:-1]:
+        if not isinstance(node.get(part), dict):
+            node[part] = {}
+        node = node[part]
+    node[parts[-1]] = value
 
 
 def _load_env(env_path: Path, override: bool = False) -> None:
@@ -179,59 +244,3 @@ def _load_env(env_path: Path, override: bool = False) -> None:
         return
     if env_path.exists():
         load_dotenv(env_path, override=override, encoding="utf-8-sig")
-
-
-# ─── Точечная запись значения в YAML без потери комментариев ───────────────
-
-_KEY_RE = re.compile(r"""^(?P<key>"[^"]*"|'[^']*'|[^\s:#'"][^:#]*?)\s*:(?=\s|$)""")
-_VALUE_RE = re.compile(r"^(?P<head>\s*[^:#]+?\s*:[ \t]*)(?P<value>[^#\r\n]*?)(?P<tail>[ \t]*(?:#.*)?)(?P<eol>\r?\n?)$")
-
-
-def _find_key_line(lines: list[str], path: list[str]) -> int | None:
-    stack: list[tuple[int, str]] = []
-    for index, line in enumerate(lines):
-        stripped = line.lstrip(" ")
-        if not stripped.strip() or stripped.startswith("#"):
-            continue
-        indent = len(line) - len(stripped)
-        match = _KEY_RE.match(stripped)
-        if not match:
-            continue
-        key = match.group("key").strip().strip("\"'")
-        while stack and stack[-1][0] >= indent:
-            stack.pop()
-        if [k for _, k in stack] + [key] == path:
-            return index
-        stack.append((indent, key))
-    return None
-
-
-def _format_scalar(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if value is None:
-        return "null"
-    if isinstance(value, (int, float)):
-        return str(value)
-    text = str(value)
-    if re.fullmatch(r"[\w.\-/]+", text) and text.lower() not in {"true", "false", "null", "yes", "no", "on", "off"}:
-        return text
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def persist_scalar(path: Path, keys: list[str], value: Any) -> bool:
-    """Заменяет значение ключа keys (например ["llm", "backend"]) прямо в тексте YAML."""
-    text = path.read_text(encoding="utf-8-sig")
-    lines = text.splitlines(keepends=True)
-    index = _find_key_line(lines, keys)
-    if index is None:
-        log.info("Ключ %s не найден в %s — значение не сохранено", ".".join(keys), path.name)
-        return False
-    match = _VALUE_RE.match(lines[index])
-    if not match:
-        return False
-    lines[index] = match.group("head") + _format_scalar(value) + match.group("tail") + match.group("eol")
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text("".join(lines), encoding="utf-8")
-    os.replace(tmp, path)
-    return True

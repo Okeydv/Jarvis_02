@@ -7,13 +7,12 @@ import logging
 import queue
 import threading
 import time
-import urllib.request
 from collections import deque
-from pathlib import Path
 from typing import Callable
 
 import numpy as np
 
+from .downloads import ensure_file
 from .text_utils import normalize, prepare_for_speech
 
 log = logging.getLogger(__name__)
@@ -28,28 +27,6 @@ class SpeechError(Exception):
         self.hint = hint
 
 
-def download_file(url: str, target: Path, progress: Callable[[int], None] | None = None) -> None:
-    """Скачивает файл во временный *.part и переименовывает по завершении."""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_suffix(target.suffix + ".part")
-    request = urllib.request.Request(url, headers={"User-Agent": "Jarvis-assistant"})
-    with urllib.request.urlopen(request, timeout=60) as response, open(temp, "wb") as file:
-        total = int(response.headers.get("Content-Length") or 0)
-        done, last = 0, -1
-        while True:
-            block = response.read(1 << 16)
-            if not block:
-                break
-            file.write(block)
-            done += len(block)
-            if progress and total:
-                percent = done * 100 // total
-                if percent != last:
-                    last = percent
-                    progress(percent)
-    temp.replace(target)
-
-
 class Speaker:
     """Озвучивает текст по предложениям: синтез следующего идёт, пока играет предыдущее."""
 
@@ -59,6 +36,8 @@ class Speaker:
         self.on_error = on_error
         self.available = False
         self.speaking = False
+        self.level = 0.0  # громкость текущего звука 0…1 — для анимации
+        self.voices: list[str] = []
         self._model = None
         self._torch = None
         self._text: queue.Queue = queue.Queue()
@@ -89,13 +68,13 @@ class Speaker:
             raise SpeechError("Не указан tts.model_path в config.yaml.")
         if not path.exists():
             url = str(self.config.get("tts.model_url"))
-            status("Скачиваю модель синтеза речи Silero (≈40 МБ)…")
+            status("скачиваю модель синтеза речи (≈40 МБ)")
             try:
-                download_file(url, path, lambda p: status(f"Скачиваю модель синтеза речи Silero: {p}%"))
+                ensure_file(url, path, lambda p: status(f"скачиваю модель синтеза речи: {p}%"))
             except Exception as exc:
                 raise SpeechError(f"Не удалось скачать модель Silero: {exc}",
                                   f"Скачайте вручную {url} и положите в {path} (или запустите python download_models.py).") from None
-        status("Загружаю синтез речи…")
+        status("загружаю синтез речи")
         try:
             # Читаем файл средствами Python: так не мешает кириллица в пути к папке.
             importer = torch.package.PackageImporter(io.BytesIO(path.read_bytes()))
@@ -104,7 +83,8 @@ class Speaker:
         except Exception as exc:
             raise SpeechError(f"Не удалось загрузить модель Silero ({path}): {exc}",
                               "Удалите файл модели — при следующем запуске он скачается заново.") from None
-        speakers = list(getattr(model, "speakers", []) or [])
+        speakers = [v for v in (getattr(model, "speakers", []) or []) if v != "random"]
+        self.voices = speakers
         if speakers and self.speaker not in speakers:
             log.warning("Голоса %s нет в модели, использую aidar. Доступны: %s", self.speaker, speakers)
             self.speaker = "aidar"
@@ -122,6 +102,10 @@ class Speaker:
             self._pending += 1
             generation = self._generation
         self._text.put((generation, text))
+
+    def set_voice(self, name: str) -> None:
+        if not self.voices or name in self.voices:
+            self.speaker = name
 
     def stop(self) -> None:
         """Прерывает речь немедленно и очищает очередь."""
@@ -233,11 +217,15 @@ class Speaker:
                 if generation != self._generation:
                     stream.abort()
                     return
-                stream.write(data[start:start + block])
+                piece = data[start:start + block]
+                rms = float(np.sqrt(np.mean(piece ** 2))) if piece.size else 0.0
+                self.level = min(1.0, rms * 4)
+                stream.write(piece)
             stream.stop()  # дожидаемся, пока доиграет буфер
         except Exception as exc:
             log.warning("Ошибка воспроизведения: %s", exc)
         finally:
+            self.level = 0.0
             stream.close()
 
     def _play_earcon(self, kind: str) -> None:

@@ -248,3 +248,100 @@ def test_close_app_refuses_protected_and_own_processes(config):
     assert not explorer
     title, processes, explorer = tools.find_app_processes(services, "проводник")
     assert explorer and processes == []
+
+
+def test_create_and_list_folder(config, monkeypatch, tmp_path):
+    monkeypatch.setattr(winapi, "known_folder", lambda name: tmp_path / name)
+    registry, _ = make_registry(config)
+    result = registry.execute("create_folder", {"path": "Проекты"})  # только имя → на рабочем столе
+    assert result.ok and (tmp_path / "Desktop" / "Проекты").is_dir()
+    assert registry.execute("create_folder", {"path": "Документы/Отчёты/2026"}).ok
+    assert (tmp_path / "Documents" / "Отчёты" / "2026").is_dir()
+    assert "уже существует" in registry.execute("create_folder", {"path": "Проекты"}).text
+    (tmp_path / "Desktop" / "файл.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "Desktop" / "desktop.ini").write_text("x", encoding="utf-8")
+    text = registry.execute("list_folder", {"path": "Рабочий стол"}).text
+    assert "Проекты/" in text and "файл.txt" in text and "desktop.ini" not in text
+    assert text.index("Проекты/") < text.index("файл.txt")  # сначала папки
+    assert "пуста" in registry.execute("list_folder", {"path": "Документы/Отчёты/2026"}).text
+    assert registry.execute("list_folder", {"path": "Нет такой папки"}).status == "error"
+    assert registry.execute("create_folder", {"path": "Корзина"}).status == "error"
+
+
+class FakeVolume:
+    def __init__(self, level=0.5, muted=1):
+        self.level, self.muted = level, muted
+
+    def GetMasterVolumeLevelScalar(self):  # noqa: N802 — как в pycaw
+        return self.level
+
+    def SetMasterVolumeLevelScalar(self, value, context):  # noqa: N802
+        self.level = value
+
+    def GetMute(self):  # noqa: N802
+        return self.muted
+
+    def SetMute(self, value, context):  # noqa: N802
+        self.muted = value
+
+
+def test_volume_tools(config, monkeypatch):
+    volume = FakeVolume()
+    monkeypatch.setattr(tools, "_endpoint_volume", lambda: volume)
+    registry, _ = make_registry(config)
+    assert registry.execute("change_volume", {"delta": 30}).text == "Громкость: было 50%, стало 80%."
+    assert volume.muted == 0  # «погромче» снимает режим без звука
+    assert registry.execute("change_volume", {"delta": -100}).ok and volume.level == 0
+    assert registry.execute("change_volume", {"delta": 150}).status == "error"
+    assert registry.execute("set_volume", {"level": 40}).ok and round(volume.level * 100) == 40
+    assert registry.execute("mute", {"on": True}).ok and volume.muted == 1
+
+    def no_device():
+        raise ToolError("не найдено устройство вывода звука (динамики или наушники)")
+
+    monkeypatch.setattr(tools, "_endpoint_volume", no_device)
+    result = registry.execute("set_volume", {"level": 10})
+    assert result.status == "error" and "устройство вывода" in result.text
+
+
+def test_set_brightness(config, monkeypatch):
+    import subprocess
+
+    scripts = []
+    returncode = [0]
+    monkeypatch.setattr(winapi, "_require_windows", lambda: None)
+    monkeypatch.setattr(winapi, "run_powershell", lambda script, timeout=0: scripts.append(script)
+                        or subprocess.CompletedProcess([], returncode[0], "", ""))
+    registry, _ = make_registry(config)
+    assert registry.execute("set_brightness", {"level": 40}).ok
+    assert "WmiSetBrightness" in scripts[0] and "Brightness=40" in scripts[0]
+    returncode[0] = 1
+    result = registry.execute("set_brightness", {"level": 70})
+    assert result.status == "error" and "open_settings" in result.text
+
+
+@pytest.mark.parametrize("page, uri", [
+    ("Bluetooth", "ms-settings:bluetooth"),
+    ("Wi-Fi", "ms-settings:network-wifi"),
+    ("экран", "ms-settings:display"),
+    ("доступ к микрофону", "ms-settings:privacy-microphone"),
+    ("обновление", "ms-settings:windowsupdate"),  # неточное название
+    ("ms-settings:sound", "ms-settings:sound"),
+    ("что-то непонятное", "ms-settings:"),
+])
+def test_open_settings(config, monkeypatch, page, uri):
+    opened = []
+    monkeypatch.setattr(winapi, "_require_windows", lambda: None)
+    monkeypatch.setattr(tools.os, "startfile", lambda target: opened.append(target), raising=False)
+    registry, _ = make_registry(config)
+    assert registry.execute("open_settings", {"page": page}).ok
+    assert opened == [uri]
+
+
+def test_all_tools_listed_for_model(config):
+    registry, _ = make_registry(config)
+    names = [schema["name"] for schema in registry.schemas()]
+    assert len(names) == len(TOOLS) - 1  # run_powershell выключен по умолчанию
+    for name in ("create_folder", "list_folder", "change_volume", "set_brightness", "open_settings",
+                 "cancel_shutdown"):
+        assert name in names

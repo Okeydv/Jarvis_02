@@ -210,7 +210,13 @@ def test_gemini_contents_config_and_stream(config, monkeypatch):
     assert cfg.automatic_function_calling.disable is True
     assert cfg.thinking_config.thinking_level == types.ThinkingLevel.LOW
     declaration = cfg.tools[0].function_declarations[0]
-    assert declaration.name == "open_app" and declaration.parameters_json_schema["required"] == ["name"]
+    assert declaration.name == "open_app" and declaration.parameters.required == ["name"]
+    # Gemini отклоняет объект с пустыми properties — у функций без параметров они не пустые
+    for item in cfg.tools[0].function_declarations:
+        assert item.parameters.type == types.Type.OBJECT and item.parameters.properties, item.name
+    volume = next(d for d in cfg.tools[0].function_declarations if d.name == "set_volume")
+    assert volume.parameters.properties["level"].type == types.Type.INTEGER
+    assert volume.parameters.properties["level"].maximum == 100
     assert backend.build_config("SYS", TOOL_SCHEMAS, allow_tools=False).tool_config.function_calling_config.mode \
         == types.FunctionCallingConfigMode.NONE
     config.set("gemini.model", "gemini-2.5-flash")
