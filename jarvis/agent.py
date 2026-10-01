@@ -66,11 +66,13 @@ def quick_reply(results: list[ToolResult], said_something: bool) -> str:
 
 
 CODE_TOOLS = {"write_file", "run_python", "read_file", "skill"}
+CONTEXT_TITLE = "Справка для тебя — это не слова пользователя, учитывай, только если это к месту:"
 
 
 def with_context(window: list[dict], context: str) -> list[dict]:
-    """Контекст (активное окно) — к текущей реплике пользователя, только для модели, не в историю.
-    Системный промпт не меняется, поэтому локальная модель не пересчитывает его заново."""
+    """Справка (память, сценарии, навыки, активное окно) — к текущей реплике пользователя, только для
+    модели, не в историю. Системный промпт и описания инструментов при этом не меняются, поэтому
+    локальная модель берёт их из кэша, а не пересчитывает тысячи токенов заново."""
     if not context:
         return window
     last_user = max((i for i, m in enumerate(window) if m["role"] == "user"), default=None)
@@ -78,7 +80,7 @@ def with_context(window: list[dict], context: str) -> list[dict]:
         return window
     message = window[last_user]
     window = list(window)
-    window[last_user] = {**message, "content": f"{message['content']}\n\n({context}; упоминай, только если это к месту)"}
+    window[last_user] = {**message, "content": f"{message['content']}\n\n[{CONTEXT_TITLE}\n{context}]"}
     return window
 
 
@@ -158,21 +160,28 @@ class Agent:
                 self.history[:] = trim_history(self.history, MAX_STORED_MESSAGES)
 
     def build_system(self, tools: list[dict]) -> str:
-        """Системный промпт: характер + что Джарвис помнит, его сценарии и навыки."""
+        """Системный промпт — неизменный от запроса к запросу (его кэширует локальная модель)."""
         system = str(self.config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT).strip()
-        services = self.registry.services
-        for block in (services.memory.prompt_block, services.routines.prompt_block, services.skills.prompt_block):
-            try:
-                text = block()
-            except Exception:  # повреждённый файл памяти не должен мешать отвечать
-                log.exception("Не удалось прочитать данные для промпта")
-                text = ""
-            if text:
-                system += "\n\n" + text
         if any(t["name"] == "run_powershell" for t in tools):
             system += ("\nДля задач на компьютере, для которых нет отдельного инструмента, используй "
                        "run_powershell — пользователь подтверждает каждую команду.")
         return system
+
+    def build_context(self) -> str:
+        """Что меняется со временем: что Джарвис помнит о пользователе, его сценарии и навыки,
+        активное окно. Идёт к текущей реплике (см. with_context)."""
+        services = self.registry.services
+        parts = []
+        for block in (services.memory.prompt_block, services.routines.prompt_block, services.skills.prompt_block,
+                      self.context):
+            try:
+                text = block()
+            except Exception:  # повреждённый файл памяти или ошибка WinAPI не должны мешать отвечать
+                log.exception("Не удалось собрать справку для модели")
+                text = ""
+            if text:
+                parts.append(text.strip())
+        return "\n".join(parts)
 
     def run(self, user_text: str, cancel: threading.Event) -> AgentOutcome:
         max_steps = max(1, int(self.config.get("llm.max_steps", 5)))
@@ -196,10 +205,7 @@ class Agent:
             return outcome
         tools = self.registry.schemas()
         system = self.build_system(tools)
-        try:
-            context = self.context()
-        except Exception:
-            context = ""
+        context = self.build_context()
 
         step = 0
         while step < max_steps:

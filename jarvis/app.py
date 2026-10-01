@@ -261,12 +261,14 @@ class JarvisApp:
     def _check_backend(self, name: str) -> None:
         try:
             backend = self._get_backend(name)
-            backend.check()
+            note = backend.check()
             if name == self.backend_name:
                 self.ui.post("system", f"{BACKEND_TITLES[name]}: модель {backend.model} на связи. "
                                        f"Инструментов управления ПК: {len(self.registry.schemas())}.")
-            system = str(self.config.get("system_prompt") or "").strip()
-            backend.warmup(system, self.registry.schemas())
+                if note:
+                    self.ui.post("system", note)
+            schemas = self.registry.schemas()
+            backend.warmup(self.agent.build_system(schemas), schemas)  # тот же промпт, что в запросах — для кэша
         except LLMError as exc:
             if name == self.backend_name:
                 self.ui.post("error", exc.message, exc.hint)
@@ -572,7 +574,7 @@ class JarvisApp:
             process = psutil.Process(winapi.window_pid(hwnd)).name()
         except psutil.Error:
             process = ""
-        return f"активное окно пользователя: «{title[:120]}»" + (f" ({process})" if process else "")
+        return f"Активное окно пользователя: «{title[:120]}»" + (f" ({process})" if process else "")
 
     def _on_schedule_due(self, task: dict) -> None:  # поток scheduler
         what = f"сценарий «{task['routine']}»" if task.get("routine") else f"«{task.get('prompt')}»"

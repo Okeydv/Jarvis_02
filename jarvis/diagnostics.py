@@ -181,8 +181,10 @@ def check_backend(report: Report, config, backend=None) -> None:
     try:
         backend = backend or create_backend(name, config)
         started = time.monotonic()
-        backend.check()
+        note = backend.check()
         report.add(f"{OK} {backend.model}: на связи ({time.monotonic() - started:.1f} с)")
+        if note:
+            report.add(f"{WARN} {note}")
     except LLMError as exc:
         report.add(f"{FAIL} {exc.message} {exc.hint}".rstrip())
         return

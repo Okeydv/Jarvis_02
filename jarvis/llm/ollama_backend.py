@@ -15,6 +15,7 @@ from .base import AssistantTurn, LLMBackend, LLMError, TextCallback, ToolCall
 log = logging.getLogger(__name__)
 
 _DOWNLOAD_HINT = "Если Ollama не установлена — скачайте её с https://ollama.com/download"
+FAST_MODELS_HINT = "qwen3:4b-instruct или qwen3:8b"
 
 
 def _partial_suffix(text: str, tag: str) -> int:
@@ -26,14 +27,16 @@ def _partial_suffix(text: str, tag: str) -> int:
 
 
 class ThinkFilter:
-    """Вырезает <think>…</think> из потока: старые версии Ollama игнорируют think=False."""
+    """Вырезает <think>…</think> из потока: старые версии Ollama игнорируют think=False.
+    inside=True — размышления уже начаты шаблоном модели (открывающего тега в ответе не будет)."""
 
     OPEN, CLOSE = "<think>", "</think>"
 
-    def __init__(self) -> None:
+    def __init__(self, inside: bool = False) -> None:
         self._buf = ""
-        self._inside = False
+        self._inside = inside
         self._started = False
+        self.stray_close = False  # встретился «</think>» без открывающего — модель всё-таки размышляла
 
     def _start(self, text: str) -> str:
         if not self._started:
@@ -55,8 +58,14 @@ class ThinkFilter:
                 self._inside = False
             else:
                 index = self._buf.find(self.OPEN)
+                close = self._buf.find(self.CLOSE)
+                if close >= 0 and (index < 0 or close < index):
+                    self.stray_close = True  # рассуждения без <think>: всё до «</think>» — не ответ
+                    out.clear()
+                    self._buf = self._buf[close + len(self.CLOSE):]
+                    continue
                 if index < 0:
-                    keep = _partial_suffix(self._buf, self.OPEN)
+                    keep = max(_partial_suffix(self._buf, self.OPEN), _partial_suffix(self._buf, self.CLOSE))
                     out.append(self._buf[:len(self._buf) - keep])
                     self._buf = self._buf[len(self._buf) - keep:]
                     break
@@ -69,6 +78,16 @@ class ThinkFilter:
         rest = "" if self._inside else self._buf
         self._buf = ""
         return self._start(rest)
+
+
+_GENERATION_THINK_RE = re.compile(r"assistant(?:\|>|｜>)?(?:\n|\\n)<think>")
+
+
+def template_always_thinks(template: str) -> bool:
+    """Шаблон сам открывает <think> в начале каждого ответа (сразу после «assistant») и не умеет
+    выключать размышления — так устроены «думающие» модели, например qwen3:4b = qwen3:4b-thinking.
+    Упоминание <think> в разборе прошлых ответов (как у qwen3:4b-instruct) не в счёт."""
+    return bool(_GENERATION_THINK_RE.search(template)) and not re.search(r"\.Think\b", template)
 
 
 def strip_think(text: str) -> str:
@@ -141,6 +160,8 @@ class OllamaBackend(LLMBackend):
         self.client = ollama.Client(host=self.host, **kwargs)
         self._think_supported = True
         self._main_has_vision: bool | None = None
+        self._thinking_checked_for = ""
+        self._always_thinks = False
 
     @property
     def model(self) -> str:
@@ -188,9 +209,42 @@ class OllamaBackend(LLMBackend):
                             f"Скачайте её командой: ollama pull {self.model}")
         if "memory" in low:
             return LLMError(f"Не хватает памяти для модели «{self.model}»: {text}",
-                            "Закройте тяжёлые программы или выберите модель поменьше, например qwen3:4b "
-                            "(ollama pull qwen3:4b и ollama.model в config.yaml).")
+                            "Закройте тяжёлые программы или выберите модель поменьше, например qwen3:4b-instruct "
+                            "(ollama pull qwen3:4b-instruct и ollama.model в config.yaml).")
         return LLMError(f"Ошибка Ollama: {text}")
+
+    # ─── размышления ───
+    def _inspect_thinking(self, info=None) -> None:
+        """Умеет ли модель отвечать без размышлений. «Думающие» модели (qwen3:4b, deepseek-r1…) размышляют
+        всегда: им передаём think=True, чтобы Ollama отделила рассуждения от ответа — иначе они попадут
+        в чат и в озвучку («Хорошо, пользователь просит…»)."""
+        self._thinking_checked_for = self.model
+        values = None
+        try:  # в /api/show новых версий Ollama есть thinking.values: [True] — выключить нельзя
+            response = self.client._client.post("/api/show", json={"model": self.model})
+            if response.status_code == 200:
+                values = (response.json().get("thinking") or {}).get("values")
+        except Exception:
+            values = None
+        if isinstance(values, list) and values:
+            self._always_thinks = values == [True]
+            return
+        try:
+            info = info if info is not None else self.client.show(self.model)
+            capabilities = getattr(info, "capabilities", None) or []
+            self._always_thinks = (not capabilities or "thinking" in capabilities) and \
+                template_always_thinks(getattr(info, "template", "") or "")
+        except Exception:
+            self._always_thinks = False
+
+    @property
+    def always_thinks(self) -> bool:
+        if self._thinking_checked_for != self.model:
+            self._inspect_thinking()
+        return self._always_thinks
+
+    def _think_value(self) -> bool:
+        return bool(self.config.get("ollama.think", False)) or self.always_thinks
 
     # ─── запросы ───
     def check(self) -> str | None:
@@ -204,6 +258,11 @@ class OllamaBackend(LLMBackend):
         if capabilities and "tools" not in capabilities:
             raise LLMError(f"Модель «{self.model}» не умеет вызывать инструменты — управлять ПК она не сможет.",
                            "Установите модель с поддержкой tools: ollama pull qwen3:8b")
+        self._inspect_thinking(info)
+        if self._always_thinks and not self.config.get("ollama.think", False):
+            return (f"Модель {self.model} всегда сначала размышляет, поэтому отвечает медленно. Для быстрых "
+                    f"ответов скачайте модель без размышлений ({FAST_MODELS_HINT}): например, "
+                    "ollama pull qwen3:4b-instruct — и выберите её в «Настройки → Модели».")
         return None
 
     # ─── зрение ───
@@ -259,7 +318,7 @@ class OllamaBackend(LLMBackend):
             "keep_alive": self.config.get("ollama.keep_alive", "2h"),
         }
         if self._think_supported:
-            kwargs["think"] = bool(self.config.get("ollama.think", False))
+            kwargs["think"] = self._think_value()
         try:
             self.client.chat(**kwargs)
         except Exception as exc:
@@ -294,10 +353,11 @@ class OllamaBackend(LLMBackend):
         if allow_tools and tools:
             kwargs["tools"] = self.build_tools(tools)
         if self._think_supported:
-            kwargs["think"] = bool(self.config.get("ollama.think", False))
+            kwargs["think"] = self._think_value()  # рассуждения придут отдельно (message.thinking) — их не показываем
 
         stream = self.client.chat(**kwargs)
-        think_filter = ThinkFilter()
+        # Если сервер не понимает think, рассуждения «думающей» модели придут в тексте до </think>.
+        think_filter = ThinkFilter(inside=self.always_thinks and not self._think_supported)
         text_parts: list[str] = []
         calls: list[ToolCall] = []
         # Пока начало ответа похоже на JSON, текст придерживаем: это может быть вызов
@@ -336,6 +396,10 @@ class OllamaBackend(LLMBackend):
         rest = think_filter.flush()
         if rest and not cancel.is_set():
             emit(rest)
+        if think_filter.stray_close and not self._always_thinks:
+            log.warning("Модель %s размышляет, хотя её просили не делать этого, — дальше рассуждения отделяются",
+                        self.model)
+            self._always_thinks = True
         if held and not cancel.is_set():
             pending = "".join(held)
             rescued = [] if calls else parse_text_tool_calls(pending, {t["name"] for t in tools})

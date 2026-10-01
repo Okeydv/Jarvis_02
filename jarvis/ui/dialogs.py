@@ -331,8 +331,10 @@ class SettingsDialog(ctk.CTkToplevel):
         page = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         page.pack(fill="both", expand=True)
         row = self._section(page, "Ollama (локально, бесплатно)",
-                            "Модель должна поддерживать инструменты, например qwen3:8b или qwen3:4b.")
-        self.ollama_model = self._combo(row, ["qwen3:8b", "qwen3:4b", "qwen3:14b"], str(self.cfg.get("ollama.model", "")), 260)
+                            "Модель должна поддерживать инструменты: qwen3:8b, а на слабом компьютере — быстрая "
+                            "qwen3:4b-instruct (без размышлений). Скачать: ollama pull <модель>.")
+        self.ollama_model = self._combo(row, ["qwen3:8b", "qwen3:4b-instruct", "qwen3:14b"],
+                                        str(self.cfg.get("ollama.model", "")), 260)
         self.ollama_model.pack(side="left")
         self.ollama_host = self._entry(row, str(self.cfg.get("ollama.host", "")), 250)
         self.ollama_host.pack(side="left", padx=8)

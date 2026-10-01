@@ -36,10 +36,72 @@ def test_think_filter_streaming():
     assert f.feed("Обычный <b>текст</b>") + f.flush() == "Обычный <b>текст</b>"
 
 
+THINKING_TEMPLATE = '{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant\n<think>\n{{ end }}'
+HYBRID_TEMPLATE = ('<|im_start|>assistant\n{{ if and $.IsThinkSet (not $.Think) -}}\n<think>\n\n</think>\n\n'
+                   '{{ end -}}')
+INSTRUCT_TEMPLATE = ("{%- if '</think>' in content %}{%- set content = content.split('</think>')[-1] %}{%- endif %}"
+                     "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}")
+
+
+def test_think_filter_without_opening_tag():
+    f = ThinkFilter()
+    assert f.feed("Хорошо, пользователь просит…</think>\n\nОткрываю.") + f.flush() == "Открываю." and f.stray_close
+    f = ThinkFilter(inside=True)  # шаблон «думающей» модели сам открыл <think>
+    assert "".join(f.feed(p) for p in ["Пользователь", " просит…</th", "ink>Готово."]) + f.flush() == "Готово."
+
+
+def test_always_thinking_model_reasoning_is_hidden(config):
+    """qwen3:4b в Ollama — «думающая» версия: размышления не выключить. Тогда просим Ollama отделить
+    их (think=True) — в чат и озвучку попадает только ответ — и советуем быструю модель."""
+    import httpx
+    import ollama
+
+    from jarvis.llm.ollama_backend import template_always_thinks
+
+    assert template_always_thinks(THINKING_TEMPLATE)
+    assert not template_always_thinks(HYBRID_TEMPLATE) and not template_always_thinks(INSTRUCT_TEMPLATE)
+
+    config.set("ollama.model", "qwen3:4b")
+    backend = create_backend("ollama", config)
+
+    def old_server(*args, **kwargs):  # сервер без thinking.values в /api/show — решаем по шаблону
+        raise httpx.ConnectError("нет")
+
+    backend.client._client.post = old_server
+    backend.client.show = lambda model: ollama.ShowResponse(template=THINKING_TEMPLATE, model_info=None,
+                                                            capabilities=["completion", "tools", "thinking"])
+    note = backend.check()
+    assert backend.always_thinks and "qwen3:4b-instruct" in note
+    captured = {}
+
+    def fake_chat(**kwargs):
+        captured.update(kwargs)
+        return iter([
+            ollama.ChatResponse(model="m", message=ollama.Message(role="assistant", content="", thinking="Пользователь…")),
+            ollama.ChatResponse(model="m", message=ollama.Message(role="assistant", content="Сейчас 12:00, сэр."), done=True),
+        ])
+
+    backend.client.chat = fake_chat
+    pieces = []
+    turn = backend.stream_chat("SYS", [{"role": "user", "content": "Который час?"}], TOOL_SCHEMAS, True,
+                               threading.Event(), pieces.append)
+    assert captured["think"] is True and "".join(pieces) == turn.text == "Сейчас 12:00, сэр."
+
+    config.set("ollama.model", "qwen3:8b")  # модель, которая умеет не размышлять, но всё же размышляет в тексте
+    backend.client.show = lambda model: ollama.ShowResponse(template=HYBRID_TEMPLATE, model_info=None,
+                                                            capabilities=["completion", "tools", "thinking"])
+    assert backend.check() is None and not backend.always_thinks
+    backend.client.chat = lambda **kwargs: iter([ollama.ChatResponse(
+        model="m", message=ollama.Message(role="assistant", content="Хорошо, пользователь…</think>Готово, сэр."))])
+    turn = backend.stream_chat("SYS", [{"role": "user", "content": "x"}], [], False, threading.Event(), lambda d: None)
+    assert turn.text == "Готово, сэр." and backend.always_thinks  # дальше рассуждения отделяются сразу
+
+
 def test_ollama_messages_and_stream(config):
     import ollama
 
     backend = create_backend("ollama", config)
+    backend._thinking_checked_for, backend._always_thinks = backend.model, False  # без запроса к серверу
     messages = backend.build_messages("SYS", history_with_parallel_calls())
     assert messages[0] == {"role": "system", "content": "SYS"}
     assert messages[2]["tool_calls"][0]["function"] == {"name": "set_volume", "arguments": {"level": 30}}
@@ -299,6 +361,7 @@ def test_ollama_rescues_textual_tool_call(config):
     import ollama
 
     backend = create_backend("ollama", config)
+    backend._thinking_checked_for, backend._always_thinks = backend.model, False  # без запроса к серверу
 
     def fake_chat(**kwargs):
         pieces = ['{"name": "get_', 'datetime", "argu', 'ments": {}}']

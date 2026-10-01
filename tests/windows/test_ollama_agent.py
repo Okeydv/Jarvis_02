@@ -11,7 +11,9 @@ import pytest
 if sys.platform != "win32":
     pytest.skip("проверки только для Windows", allow_module_level=True)
 
+import re  # noqa: E402
 import threading  # noqa: E402
+import time  # noqa: E402
 
 from jarvis.agent import Agent  # noqa: E402
 from jarvis.llm import create_backend  # noqa: E402
@@ -51,10 +53,13 @@ class Events:
 def agent(config, registry):
     config.set("ollama.model", MODEL)
     backend = create_backend("ollama", config)
-    backend.check()
-    backend.warmup(str(config.get("system_prompt")), registry.schemas())
+    note = backend.check()
+    assert note is None, note  # модель отвечает без долгих размышлений
     events = Events()
     agent = Agent(config, registry, lambda: backend, events)
+    started = time.monotonic()
+    backend.warmup(agent.build_system(registry.schemas()), registry.schemas())
+    print(f"\nПрогрев модели: {time.monotonic() - started:.0f} с")
     agent.events_log = events
     yield agent
     backend.close()
@@ -64,10 +69,14 @@ def ask(agent, text: str):
     events = agent.events_log
     start = len(events.calls)
     print(f"\nПользователь: {text}")
+    started = time.monotonic()
     outcome = agent.run(text, threading.Event())
-    print(f"Джарвис: {''.join(events.texts).strip()}")
+    reply = "".join(events.texts).strip()
+    print(f"Джарвис ({time.monotonic() - started:.0f} с): {reply}")
     events.texts.clear()
     assert not events.errors, events.errors
+    # рассуждения модели («Хорошо, пользователь просит…») не должны попадать в ответ и озвучку
+    assert not re.search(r"пользователь (просит|попросил|спрашивает|хочет)", reply.lower()), reply
     return outcome, events.calls[start:]
 
 

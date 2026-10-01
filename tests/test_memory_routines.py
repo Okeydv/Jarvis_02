@@ -244,12 +244,15 @@ def test_memory_and_routines_reach_the_model(config):
     services = agent.registry.services
     services.memory.remember("Меня зовут Иван")
     services.routines.save("кино", '[{"tool": "mute", "arguments": {"on": false}}]')
-    agent.context = lambda: "активное окно пользователя: «main.py — Visual Studio Code» (Code.exe)"
+    agent.context = lambda: "Активное окно пользователя: «main.py — Visual Studio Code» (Code.exe)"
     agent.run("Привет", threading.Event())
-    system = backend.calls[0]["system"]
-    assert "- Меня зовут Иван" in system and "«кино»" in system
+    # Системный промпт не меняется (его кэширует локальная модель), а справка — у текущей реплики
+    assert backend.calls[0]["system"] == agent.build_system(agent.registry.schemas())
+    assert "Иван" not in backend.calls[0]["system"]
     last = backend.calls[0]["messages"][-1]["content"]
-    assert last.startswith("Привет") and "main.py — Visual Studio Code" in last
+    assert last.startswith("Привет") and "- Меня зовут Иван" in last and "«кино»" in last
+    assert "main.py — Visual Studio Code" in last
+    assert agent.history[0]["content"] == "Привет"  # в историю справка не попадает
     assert agent.history[0]["content"] == "Привет"  # в историю контекст не попадает
 
 

@@ -123,7 +123,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 50
     env:
-      JARVIS_OLLAMA_MODEL: qwen3:4b
+      JARVIS_OLLAMA_MODEL: qwen3:4b-instruct  # «qwen3:4b» в Ollama — думающая версия, она медленная
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
