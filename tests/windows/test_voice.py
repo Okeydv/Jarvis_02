@@ -102,7 +102,8 @@ def test_cable_is_listed_as_microphone(cable):
 def test_jarvis_mode_hears_wake_word_and_command(cable, speaker, listener):
     listener.set_continuous(True)
     assert wait_for(lambda: listener.stream_open, 10), listener.events.errors
-    assert "CABLE Output" in listener.device_name
+    print("Открыт микрофон:", listener.device_name)
+    assert "CABLE Output" in listener.device_name and "VB-Audio Point" not in listener.device_name
     time.sleep(1.0)
     say(speaker, "Джарвис, открой блокнот.", cable[0])
     assert wait_for(lambda: listener.events.finals, 10), (listener.events.partials[-5:], listener.events.errors)

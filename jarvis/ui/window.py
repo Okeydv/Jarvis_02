@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 BACKENDS = {"ollama": "Ollama", "gigachat": "GigaChat", "gemini": "Gemini", "qwen": "Qwen"}
 _BACKEND_BY_TITLE = {title: name for name, title in BACKENDS.items()}
 # Подсказки-примеры: нажатие отправляет команду (заодно видно, что Джарвис управляет ПК).
-QUICK_COMMANDS = ["Который час?", "Открой браузер", "Сделай погромче", "Сделай скриншот"]
+QUICK_COMMANDS = ["Какая погода?", "Открой браузер", "Сделай погромче", "Который час?"]
 WINDOW_SIZE = (1380, 860)
 
 
@@ -329,12 +329,14 @@ class MainWindow(ctk.CTk):
         if request_id == self._chat_request and self._bubble is not None:
             if suffix:
                 self._bubble.set_text(self._bubble.text.rstrip() + suffix)
+            self._bubble.render_rich()
             self._bubble = None
+            self.chat.scroll_to_end()
 
     def _ev_assistant_message(self, request_id: int, text: str) -> None:
         if request_id == self._chat_request:
             self._bubble = None
-            self.chat.add_jarvis(text)
+            self.chat.add_jarvis(text).render_rich()
 
     def _ev_system(self, text: str) -> None:
         self.chat.add_system(text)

@@ -88,7 +88,9 @@ def test_voice_command_opens_and_closes_notepad(monkeypatch, artifacts):
     if playback is None or capture is None:
         pytest.skip("виртуальный кабель VB-CABLE не установлен")
     import jarvis.app as app_module
+    import main
 
+    main.setup_logging()  # лог работы окна — в logs/jarvis.log (попадёт в артефакты CI)
     monkeypatch.setattr(app_module, "create_backend", lambda name, config: ScriptedBackend(config))
     raw = yaml.safe_load((ROOT_DIR / "config.yaml").read_text(encoding="utf-8"))
     config = Config(deep_merge(DEFAULTS, raw), path=None)

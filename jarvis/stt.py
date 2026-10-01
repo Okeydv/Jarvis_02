@@ -136,6 +136,8 @@ class Listener:
         self._silence_reported = False
         self._quiet_reported = False
         self._missing_reported = None
+        self._open_error: VoiceError | None = None
+        self._open_error_reported = False
 
     # ─── загрузка ───
     def load(self, status: Callable[[str], None] = lambda text: None) -> None:
@@ -241,11 +243,14 @@ class Listener:
         with self._lock:
             self._taps.append(tap)
             self._probing += 1
+            self._open_error = None
         self._wake.set()
         chunks: list[bytes] = []
         end = time.monotonic() + seconds
         try:
             while time.monotonic() < end:
+                if self._open_error is not None and self._stream is None:
+                    raise self._open_error
                 try:
                     chunks.append(tap.get(timeout=0.1))
                 except queue.Empty:
@@ -290,7 +295,9 @@ class Listener:
 
         wanted = self.config.get("voice.input_device")
         devices = list(enumerate(sd.query_devices()))
-        inputs = [(i, d) for i, d in devices if d.get("max_input_channels", 0) > 0]
+        apis = sd.query_hostapis()
+        inputs = [(i, d) for i, d in devices if d.get("max_input_channels", 0) > 0
+                  and "WDM-KS" not in str(apis[d["hostapi"]]["name"] if d["hostapi"] < len(apis) else "")]
         order: list = []
         if wanted not in (None, "", "default"):
             if isinstance(wanted, int) or str(wanted).isdigit():
@@ -307,6 +314,12 @@ class Listener:
                     self.on_error(f"Микрофон «{wanted}» не найден — использую микрофон по умолчанию.",
                                   "Выберите микрофон в «Настройки → Голос».")
         order.append(None)  # системный микрофон по умолчанию
+        # Тот же микрофон в других звуковых API — если основной (MME) не открывается.
+        default_input = sd.default.device[0]
+        if isinstance(default_input, int) and 0 <= default_input < len(devices):
+            prefix = devices[default_input][1]["name"].strip()[:28].casefold()
+            order += [i for i, d in inputs if i != default_input and prefix and
+                      d["name"].casefold().startswith(prefix)]
         result = []
         for item in order:
             if item not in result:
@@ -321,8 +334,12 @@ class Listener:
             try:
                 info = sd.query_devices(device, "input")
                 rate = int(info.get("default_samplerate") or 16000)
+                extra = None
+                if winapi.IS_WINDOWS and "WASAPI" in str(sd.query_hostapis(info["hostapi"])["name"]):
+                    extra = sd.WasapiSettings(auto_convert=True)  # моно и любая частота в общем режиме
                 stream = sd.RawInputStream(samplerate=rate, blocksize=int(rate * 0.1), device=device,
-                                           dtype="int16", channels=1, callback=self._callback)
+                                           dtype="int16", channels=1, callback=self._callback,
+                                           extra_settings=extra)
                 stream.start()
             except Exception as exc:
                 errors.append(f"{device if device is not None else 'по умолчанию'}: {exc}")
@@ -452,11 +469,18 @@ class Listener:
             if self._stream is None:
                 try:
                     self._open_stream()
+                    self._open_error_reported = False
                 except VoiceError as exc:
                     with self._lock:
                         self._continuous = self._command = False
+                        self._open_error = exc
+                        probing = self._probing > 0
                     self.on_listening(False)
-                    self.on_error(exc.message, exc.hint)
+                    if not probing and not self._open_error_reported:  # проверку микрофона ошибка прервёт сама
+                        self._open_error_reported = True
+                        self.on_error(exc.message, exc.hint)
+                    self._wake.wait(2.0)  # пауза перед новой попыткой, а не сотни попыток в секунду
+                    self._wake.clear()
                     continue
             try:
                 data = self._audio.get(timeout=0.1)

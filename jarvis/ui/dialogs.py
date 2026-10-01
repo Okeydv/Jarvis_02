@@ -293,6 +293,11 @@ class SettingsDialog(ctk.CTkToplevel):
                             "подтвердите кнопкой «Да, выполнить».")
         self.powershell = self._switch(row, "Разрешить run_powershell", bool(self.cfg.get("tools.allow_powershell", False)))
         self.powershell.pack(side="left")
+        row = self._section(page, "Программирование",
+                            "Джарвис пишет код в файлы (write_file — открываются в VS Code, Notepad++ или Блокноте) "
+                            "и может запускать программы на Python. Каждый запуск вы подтверждаете, видя код целиком.")
+        self.allow_code = self._switch(row, "Разрешить запуск кода (run_python)", bool(self.cfg.get("tools.allow_code", True)))
+        self.allow_code.pack(side="left")
         row = self._section(page, "Проверка инструментов", "Безопасная проверка: дата, состояние системы, папки, громкость.")
         self._button(row, "Проверить инструменты", self._test_tools, "check").pack(side="left")
         self.tools_result = ctk.CTkTextbox(page, height=200, font=self.fonts.mono, fg_color=theme.INPUT,
@@ -471,6 +476,7 @@ class SettingsDialog(ctk.CTkToplevel):
             "voice.wake_words": wake or ["джарвис"],
             "voice.earcons": bool(self.earcons.get()),
             "tools.allow_powershell": bool(self.powershell.get()),
+            "tools.allow_code": bool(self.allow_code.get()),
             "ollama.model": self.ollama_model.get().strip(),
             "ollama.host": self.ollama_host.get().strip(),
             "gigachat.model": self.giga_model.get().strip(),

@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -63,16 +64,23 @@ class Tool:
     func: Callable[..., str]
     confirm: Optional[Callable[..., Optional[Confirmation]]] = None
     available: Optional[Callable[[Any], bool]] = None
+    # Действие, результат которого — готовый ответ пользователю («Громкость 30%»): после него
+    # агент может не обращаться к модели второй раз (быстрее). Функция — решение по аргументам.
+    quick: bool | Callable[[dict], bool] = False
 
     def schema(self) -> dict:
         return {"name": self.name, "description": self.description, "parameters": self.parameters}
+
+    def is_quick(self, arguments: dict) -> bool:
+        return bool(self.quick(arguments) if callable(self.quick) else self.quick)
 
 
 TOOLS: dict[str, Tool] = {}
 
 
 def tool(name: str, description: str, properties: dict | None = None, required: tuple = (),
-         confirm: Callable | None = None, available: Callable | None = None):
+         confirm: Callable | None = None, available: Callable | None = None,
+         quick: bool | Callable[[dict], bool] = False):
     """Регистрирует функцию как инструмент."""
 
     def decorator(func: Callable[..., str]) -> Callable[..., str]:
@@ -83,6 +91,7 @@ def tool(name: str, description: str, properties: dict | None = None, required: 
             func=func,
             confirm=confirm,
             available=available,
+            quick=quick,
         )
         return func
 
@@ -498,6 +507,7 @@ def launch_target(target: str, config) -> str:
     "«проводник», «телеграм», «Word» и т. п. Если программы нет в списке известных, ищет её в меню «Пуск».",
     {"name": {"type": "string", "description": "Название приложения, например «блокнот» или «Telegram»"}},
     required=("name",),
+    quick=True,
 )
 def open_app(ctx: CallContext, name: str) -> str:
     if not winapi.IS_WINDOWS:
@@ -595,6 +605,7 @@ def _confirm_close_app(ctx: CallContext, name: str, force: bool = False) -> Conf
     },
     required=("name",),
     confirm=_confirm_close_app,
+    quick=True,
 )
 def close_app(ctx: CallContext, name: str, force: bool = False) -> str:
     kind, title, payload = ctx.prepared
@@ -638,6 +649,7 @@ def close_app(ctx: CallContext, name: str, force: bool = False) -> str:
     "Открыть сайт (веб-адрес) в браузере по умолчанию.",
     {"url": {"type": "string", "description": "Адрес, например https://ya.ru или youtube.com"}},
     required=("url",),
+    quick=True,
 )
 def open_url(ctx: CallContext, url: str) -> str:
     url = url.strip()
@@ -658,6 +670,7 @@ def open_url(ctx: CallContext, url: str) -> str:
     "Найти информацию в интернете: открывает страницу поиска в браузере по умолчанию.",
     {"query": {"type": "string", "description": "Поисковый запрос"}},
     required=("query",),
+    quick=True,
 )
 def web_search(ctx: CallContext, query: str) -> str:
     template = ctx.config.get("tools.search_url", "https://www.google.com/search?q={query}")
@@ -704,6 +717,7 @@ def resolve_folder(path: str) -> Path | str:
     "«Музыка», «Видео», «Этот компьютер», «Корзина», вложенные пути вроде «Документы\\Jarvis» и полные пути.",
     {"path": {"type": "string", "description": "Название известной папки или полный путь"}},
     required=("path",),
+    quick=True,
 )
 def open_folder(ctx: CallContext, path: str) -> str:
     target = resolve_folder(path)
@@ -735,6 +749,7 @@ def _folder_path(path: str) -> Path:
     "если указано только имя — папка создаётся на рабочем столе.",
     {"path": {"type": "string", "description": "Путь или имя новой папки"}},
     required=("path",),
+    quick=True,
 )
 def create_folder(ctx: CallContext, path: str) -> str:
     target = _folder_path(path)
@@ -797,6 +812,7 @@ def _endpoint_volume():
     "Установить общую громкость звука компьютера в процентах.",
     {"level": {"type": "integer", "description": "Громкость от 0 до 100", "minimum": 0, "maximum": 100}},
     required=("level",),
+    quick=True,
 )
 def set_volume(ctx: CallContext, level: int) -> str:
     volume = _endpoint_volume()
@@ -813,6 +829,7 @@ def set_volume(ctx: CallContext, level: int) -> str:
     {"delta": {"type": "integer", "description": "Изменение громкости в процентах, от −100 до 100",
                "minimum": -100, "maximum": 100}},
     required=("delta",),
+    quick=True,
 )
 def change_volume(ctx: CallContext, delta: int) -> str:
     volume = _endpoint_volume()
@@ -830,6 +847,7 @@ def change_volume(ctx: CallContext, delta: int) -> str:
     "on=false — снова включить звук.",
     {"on": {"type": "boolean", "description": "true — выключить звук, false — включить"}},
     required=("on",),
+    quick=True,
 )
 def mute(ctx: CallContext, on: bool) -> str:
     _endpoint_volume().SetMute(1 if on else 0, None)
@@ -841,6 +859,7 @@ def mute(ctx: CallContext, on: bool) -> str:
     "Установить яркость экрана в процентах (работает на ноутбуках и мониторах с поддержкой управления яркостью).",
     {"level": {"type": "integer", "description": "Яркость от 0 до 100", "minimum": 0, "maximum": 100}},
     required=("level",),
+    quick=True,
 )
 def set_brightness(ctx: CallContext, level: int) -> str:
     winapi._require_windows()
@@ -887,6 +906,7 @@ _SETTINGS_PAGES = {
     "«принтеры», «память», «микрофон», «о системе» и т. п.",
     {"page": {"type": "string", "description": "Название раздела параметров"}},
     required=("page",),
+    quick=True,
 )
 def open_settings(ctx: CallContext, page: str) -> str:
     winapi._require_windows()
@@ -912,6 +932,7 @@ _MEDIA_KEYS = {
     {"action": {"type": "string", "enum": ["play_pause", "next", "previous"],
                 "description": "play_pause — пауза/продолжить, next — следующий, previous — предыдущий"}},
     required=("action",),
+    quick=True,
 )
 def media(ctx: CallContext, action: str) -> str:
     vk, label = _MEDIA_KEYS[action]
@@ -938,6 +959,7 @@ def _wait_for_external_window(ctx: CallContext, timeout: float = 2.0) -> int:
     "Напечатать текст в активном окне, как с клавиатуры (работает с русским и английским текстом).",
     {"text": {"type": "string", "description": "Текст для ввода"}},
     required=("text",),
+    quick=True,
 )
 def type_text(ctx: CallContext, text: str) -> str:
     if len(text) > 5000:
@@ -1055,6 +1077,7 @@ def _confirm_hotkey(ctx: CallContext, keys: str) -> Confirmation | None:
     {"keys": {"type": "string", "description": "Клавиши через «+», например ctrl+shift+t"}},
     required=("keys",),
     confirm=_confirm_hotkey,
+    quick=True,
 )
 def hotkey(ctx: CallContext, keys: str) -> str:
     combo = parse_hotkey(keys)
@@ -1077,7 +1100,7 @@ def hotkey(ctx: CallContext, keys: str) -> str:
     return f"Нажато {format_hotkey(combo)}" + (f" в окне «{title}»." if title else ".")
 
 
-@tool("screenshot", "Сделать снимок экрана и сохранить его в папку «Изображения\\Jarvis». Возвращает путь к файлу.")
+@tool("screenshot", "Сделать снимок экрана и сохранить его в папку «Изображения\\Jarvis». Возвращает путь к файлу.", quick=True)
 def screenshot(ctx: CallContext) -> str:
     from PIL import ImageGrab
 
@@ -1146,27 +1169,45 @@ def _minutes_text(minutes: float) -> str:
 
 @tool(
     "timer",
-    "Поставить таймер: через указанное число минут придёт уведомление Windows и Джарвис скажет об этом.",
+    "Поставить таймер или напоминание: через указанное число минут (minutes) или в указанное время "
+    "(at, «ЧЧ:ММ») придёт уведомление Windows и Джарвис скажет об этом.",
     {
         "minutes": {"type": "number", "description": "Через сколько минут сработать (можно дробное: 0.5 — 30 секунд)",
                     "minimum": 0.05, "maximum": 1440},
-        "label": {"type": "string", "description": "Короткая подпись, например «чай» (необязательно)"},
+        "at": {"type": "string", "description": "Время срабатывания «ЧЧ:ММ», например «15:30» (вместо minutes)"},
+        "label": {"type": "string", "description": "Короткая подпись, например «чай» или «позвонить маме»"},
     },
-    required=("minutes",),
+    quick=True,
 )
-def timer(ctx: CallContext, minutes: float, label: str = "") -> str:
-    label = label.strip() or "Таймер"
+def timer(ctx: CallContext, minutes: float | None = None, at: str = "", label: str = "") -> str:
+    label = label.strip() or ("Напоминание" if at else "Таймер")
+    now = datetime.now()
+    if at.strip():
+        match = re.fullmatch(r"\s*(\d{1,2})[:.\s](\d{2})\s*", at)
+        if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+            raise ToolError(f"время «{at}» не похоже на ЧЧ:ММ")
+        moment = now.replace(hour=int(match.group(1)), minute=int(match.group(2)), second=0, microsecond=0)
+        if moment <= now:
+            moment += timedelta(days=1)
+        seconds = (moment - now).total_seconds()
+    elif minutes:
+        seconds = float(minutes) * 60
+    else:
+        raise ToolError("укажите minutes (через сколько минут) или at (время «ЧЧ:ММ»)")
     services = ctx.services
 
     def fire() -> None:
-        services.notify("Таймер", f"Сэр, время вышло: {label}.")
+        services.notify("Таймер", f"Сэр, время вышло: {label}." if not at else f"Сэр, напоминаю: {label}.")
 
-    handle = threading.Timer(minutes * 60, fire)
+    handle = threading.Timer(seconds, fire)
     handle.daemon = True
     handle.start()
     services.timers.append(handle)
-    ends = datetime.now() + timedelta(minutes=minutes)
-    return f"Таймер «{label}» на {_minutes_text(minutes)} запущен, сработает в {ends:%H:%M:%S}."
+    ends = now + timedelta(seconds=seconds)
+    if at:
+        day = "" if ends.date() == now.date() else " завтра"
+        return f"Напоминание «{label}» поставлено на {ends:%H:%M}{day}."
+    return f"Таймер «{label}» на {_minutes_text(seconds / 60)} запущен, сработает в {ends:%H:%M:%S}."
 
 
 @tool(
@@ -1174,6 +1215,7 @@ def timer(ctx: CallContext, minutes: float, label: str = "") -> str:
     "Записать заметку в файл «Документы\\Jarvis\\notes.txt» (с датой и временем).",
     {"text": {"type": "string", "description": "Текст заметки"}},
     required=("text",),
+    quick=True,
 )
 def note(ctx: CallContext, text: str) -> str:
     folder = winapi.known_folder("Documents") / "Jarvis"
@@ -1184,7 +1226,7 @@ def note(ctx: CallContext, text: str) -> str:
     return f"Заметка сохранена в {path}."
 
 
-@tool("lock_pc", "Заблокировать компьютер (экран блокировки Windows).")
+@tool("lock_pc", "Заблокировать компьютер (экран блокировки Windows).", quick=True)
 def lock_pc(ctx: CallContext) -> str:
     winapi.lock_workstation()
     return "Компьютер заблокирован."
@@ -1194,7 +1236,7 @@ def _confirm_sleep(ctx: CallContext) -> Confirmation:
     return Confirmation("Спящий режим", "Перевести компьютер в спящий режим через 3 секунды.")
 
 
-@tool("sleep_pc", "Перевести компьютер в спящий режим. Требует подтверждения пользователя.", confirm=_confirm_sleep)
+@tool("sleep_pc", "Перевести компьютер в спящий режим. Требует подтверждения пользователя.", confirm=_confirm_sleep, quick=True)
 def sleep_pc(ctx: CallContext) -> str:
     winapi._require_windows()
     handle = threading.Timer(3, winapi.suspend)
@@ -1222,7 +1264,7 @@ def _run_shutdown(args: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(["shutdown", *args], capture_output=True, timeout=15, creationflags=winapi.CREATE_NO_WINDOW)
 
 
-@tool("shutdown_pc", "Выключить компьютер. Требует подтверждения пользователя.", confirm=_confirm_shutdown)
+@tool("shutdown_pc", "Выключить компьютер. Требует подтверждения пользователя.", confirm=_confirm_shutdown, quick=True)
 def shutdown_pc(ctx: CallContext) -> str:
     delay = _shutdown_delay(ctx)
     result = _run_shutdown(["/s", "/t", str(delay), "/c", "Джарвис: выключение по команде пользователя"])
@@ -1231,7 +1273,7 @@ def shutdown_pc(ctx: CallContext) -> str:
     return f"Компьютер выключится через {delay} с. Отменить можно командой «отмени выключение»."
 
 
-@tool("restart_pc", "Перезагрузить компьютер. Требует подтверждения пользователя.", confirm=_confirm_restart)
+@tool("restart_pc", "Перезагрузить компьютер. Требует подтверждения пользователя.", confirm=_confirm_restart, quick=True)
 def restart_pc(ctx: CallContext) -> str:
     delay = _shutdown_delay(ctx)
     result = _run_shutdown(["/r", "/t", str(delay), "/c", "Джарвис: перезагрузка по команде пользователя"])
@@ -1240,7 +1282,7 @@ def restart_pc(ctx: CallContext) -> str:
     return f"Компьютер перезагрузится через {delay} с. Отменить можно командой «отмени перезагрузку»."
 
 
-@tool("cancel_shutdown", "Отменить запланированное выключение или перезагрузку компьютера.")
+@tool("cancel_shutdown", "Отменить запланированное выключение или перезагрузку компьютера.", quick=True)
 def cancel_shutdown(ctx: CallContext) -> str:
     result = _run_shutdown(["/a"])
     if result.returncode != 0:
@@ -1273,3 +1315,497 @@ def run_powershell(ctx: CallContext, command: str) -> str:
     if len(output) > 3000:
         output = output[:3000] + "\n…(вывод обрезан)"
     return f"Код завершения {result.returncode}.\n{output or '(нет вывода)'}"
+
+
+# ═══ Код и файлы ═════════════════════════════════════════════════════
+
+_SCRIPT_EXTENSIONS = {".py", ".pyw", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jse", ".wsf", ".exe", ".msi",
+                      ".com", ".scr", ".lnk", ".reg", ".hta", ".jar"}
+MAX_FILE_CHARS = 200_000
+MAX_READ_CHARS = 12_000
+
+
+def code_folder(config) -> Path:
+    """Папка для кода, который пишет Джарвис (по умолчанию «Документы\\Jarvis\\Code»)."""
+    custom = str(config.get("tools.code_folder", "") or "").strip()
+    if custom:
+        return Path(os.path.expandvars(os.path.expanduser(custom)))
+    return winapi.known_folder("Documents") / "Jarvis" / "Code"
+
+
+def resolve_file(path: str, config) -> Path:
+    """Путь к файлу: полный путь, «Рабочий стол\\x.txt» или просто имя — тогда в папке для кода."""
+    text = path.strip().strip('"').strip("«»")
+    if not text:
+        raise ToolError("не указан путь к файлу")
+    target = resolve_folder(text)
+    if isinstance(target, str):
+        raise ToolError(f"«{path}» — системная папка, а не файл")
+    if not target.is_absolute():
+        target = code_folder(config) / target
+    return target
+
+
+def _outside_home(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(Path.home().resolve())
+        return False
+    except ValueError:
+        return True
+
+
+def find_editor(config) -> tuple[str, list[str]] | None:
+    """Редактор кода: из настроек, VS Code, Notepad++ или Блокнот. (название, команда)."""
+    custom = str(config.get("tools.code_editor", "") or "").strip()
+    if custom:
+        return os.path.basename(custom), [os.path.expandvars(custom)]
+    if not winapi.IS_WINDOWS:
+        return None
+    local = os.environ.get("LOCALAPPDATA", "")
+    program_files = [os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", "")]
+    candidates = [
+        ("Visual Studio Code", os.path.join(local, "Programs", "Microsoft VS Code", "Code.exe")),
+        *[("Visual Studio Code", os.path.join(base, "Microsoft VS Code", "Code.exe")) for base in program_files if base],
+        ("Cursor", os.path.join(local, "Programs", "cursor", "Cursor.exe")),
+        *[("Notepad++", os.path.join(base, "Notepad++", "notepad++.exe")) for base in program_files if base],
+    ]
+    for title, exe in candidates:
+        if exe and os.path.isfile(exe):
+            return title, [exe]
+    return "Блокнот", ["notepad.exe"]
+
+
+def open_in_editor(path: Path, config) -> str:
+    editor = find_editor(config)
+    if editor is None:
+        raise ToolError("редактор кода не найден")
+    title, command = editor
+    subprocess.Popen([*command, str(path)], creationflags=winapi.DETACHED_PROCESS | winapi.CREATE_NEW_PROCESS_GROUP)
+    return title
+
+
+def _confirm_write_file(ctx: CallContext, path: str, content: str, open: bool = True) -> Confirmation | None:
+    target = resolve_file(path, ctx.config)
+    reasons = []
+    if target.exists():
+        reasons.append("файл уже существует и будет перезаписан")
+    if _outside_home(target):
+        reasons.append("файл находится вне вашей папки пользователя")
+    if not reasons:
+        return None
+    lines = content.count("\n") + 1
+    return Confirmation("Записать файл", f"Записать {lines} строк в {target}: {', '.join(reasons)}.",
+                        details=content[:4000] + ("\n…" if len(content) > 4000 else ""))
+
+
+@tool(
+    "write_file",
+    "Создать или перезаписать текстовый файл: код программы (Python, HTML, JavaScript, C++ и т. д.), "
+    "скрипт, заметку, документ. Используй, когда просят написать программу или код: код сохраняется "
+    "в файл и открывается в редакторе (VS Code, Notepad++ или Блокнот). Если указано только имя — "
+    "файл создаётся в «Документы\\Jarvis\\Code». Перезапись существующего файла — с подтверждением.",
+    {
+        "path": {"type": "string", "description": "Имя файла с расширением (например snake.py) или полный путь"},
+        "content": {"type": "string", "description": "Полное содержимое файла"},
+        "open": {"type": "boolean", "description": "Открыть файл в редакторе после записи (по умолчанию да)"},
+    },
+    required=("path", "content"),
+    confirm=_confirm_write_file,
+    quick=True,
+)
+def write_file(ctx: CallContext, path: str, content: str, open: bool = True) -> str:
+    if len(content) > MAX_FILE_CHARS:
+        raise ToolError(f"слишком большой файл (больше {MAX_FILE_CHARS} символов)")
+    target = resolve_file(path, ctx.config)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # PowerShell 5 читает UTF-8 без BOM как ANSI — для .ps1 пишем с BOM.
+    encoding = "utf-8-sig" if target.suffix.lower() == ".ps1" else "utf-8"
+    target.write_text(content, encoding=encoding)
+    lines = content.count("\n") + 1
+    result = f"Файл сохранён: {target} ({lines} {ru_plural(lines, ('строка', 'строки', 'строк'))})."
+    if open:
+        try:
+            result += f" Открыт в редакторе «{open_in_editor(target, ctx.config)}»."
+        except (OSError, ToolError) as exc:
+            result += f" Открыть в редакторе не удалось: {exc}."
+    return result
+
+
+def _read_text(path: Path) -> str:
+    data = path.read_bytes()
+    if b"\0" in data[:4096]:
+        raise ToolError(f"{path.name} — двоичный файл, а не текст")
+    for encoding in ("utf-8-sig", "cp1251"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+@tool(
+    "read_file",
+    "Прочитать текстовый файл (код, заметки, конфиги), чтобы объяснить, проверить или исправить его. "
+    "Если указано только имя — ищет в «Документы\\Jarvis\\Code».",
+    {"path": {"type": "string", "description": "Имя файла или полный путь"}},
+    required=("path",),
+)
+def read_file(ctx: CallContext, path: str) -> str:
+    target = resolve_file(path, ctx.config)
+    if not target.is_file():
+        raise ToolError(f"файл не найден: {target}")
+    text = _read_text(target)
+    more = ""
+    if len(text) > MAX_READ_CHARS:
+        more = f"\n…(показаны первые {MAX_READ_CHARS} из {len(text)} символов)"
+        text = text[:MAX_READ_CHARS]
+    return f"Файл {target}:\n{text}{more}"
+
+
+@tool(
+    "open_file",
+    "Открыть файл: документ, картинку, видео — в программе по умолчанию; код и скрипты — в редакторе "
+    "(не запуская их).",
+    {"path": {"type": "string", "description": "Имя файла или полный путь"}},
+    required=("path",),
+    quick=True,
+)
+def open_file(ctx: CallContext, path: str) -> str:
+    target = resolve_file(path, ctx.config)
+    if not target.exists():
+        raise ToolError(f"файл не найден: {target}")
+    if target.is_dir():
+        os.startfile(str(target))  # type: ignore[attr-defined]
+        return f"Открыл папку {target}."
+    if target.suffix.lower() in _SCRIPT_EXTENSIONS:
+        return f"Открыл {target.name} в редакторе «{open_in_editor(target, ctx.config)}»."
+    os.startfile(str(target))  # type: ignore[attr-defined]
+    return f"Открыл файл {target.name}."
+
+
+def _python_executable() -> str:
+    exe = Path(sys.executable)
+    if exe.name.lower() == "pythonw.exe" and (exe.parent / "python.exe").exists():
+        return str(exe.parent / "python.exe")  # pythonw не даёт прочитать вывод программы
+    return str(exe)
+
+
+def _code_for_run(ctx: CallContext, code: str, path: str) -> tuple[str, Path | None]:
+    if path.strip():
+        target = resolve_file(path, ctx.config)
+        if not target.is_file():
+            raise ToolError(f"файл не найден: {target}")
+        return _read_text(target), target
+    if not code.strip():
+        raise ToolError("укажите code (текст программы) или path (файл .py)")
+    return code, None
+
+
+def _confirm_run_python(ctx: CallContext, code: str = "", path: str = "", wait: bool = True) -> Confirmation:
+    text, target = _code_for_run(ctx, code, path)
+    where = f"файл {target}" if target else "код ниже"
+    mode = "и дождаться результата" if wait else "в отдельном окне"
+    return Confirmation("Запуск кода Python", f"Выполнить на компьютере {where} {mode}. Проверьте код целиком:",
+                        details=text[:6000] + ("\n…" if len(text) > 6000 else ""), data=(text, target))
+
+
+@tool(
+    "run_python",
+    "Запустить программу на Python: код (code) или сохранённый файл (path) — и вернуть её вывод. "
+    "Для программ с окном или игр укажи wait=false: они откроются в отдельном окне. Каждый запуск "
+    "пользователь подтверждает, видя код целиком.",
+    {
+        "code": {"type": "string", "description": "Текст программы на Python"},
+        "path": {"type": "string", "description": "Файл .py вместо code (имя или полный путь)"},
+        "wait": {"type": "boolean", "description": "Ждать завершения и вернуть вывод (по умолчанию да)"},
+    },
+    confirm=_confirm_run_python,
+    available=lambda config: bool(config.get("tools.allow_code", True)),
+)
+def run_python(ctx: CallContext, code: str = "", path: str = "", wait: bool = True) -> str:
+    text, target = ctx.prepared
+    folder = target.parent if target else code_folder(ctx.config)
+    folder.mkdir(parents=True, exist_ok=True)
+    if target is None:
+        target = folder / "jarvis_run.py"
+        target.write_text(text, encoding="utf-8")
+    command = [_python_executable(), "-X", "utf8", str(target)]
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    if not wait:
+        flags = subprocess.CREATE_NEW_CONSOLE if winapi.IS_WINDOWS else 0  # type: ignore[attr-defined]
+        subprocess.Popen(command, cwd=str(folder), env=env, creationflags=flags)
+        return f"Программа {target.name} запущена в отдельном окне."
+    timeout = float(ctx.config.get("tools.code_timeout", 60))
+    try:
+        result = subprocess.run(command, cwd=str(folder), env=env, capture_output=True, timeout=timeout,
+                                stdin=subprocess.DEVNULL,
+                                creationflags=winapi.CREATE_NO_WINDOW if winapi.IS_WINDOWS else 0)
+    except subprocess.TimeoutExpired:
+        raise ToolError(f"программа работала дольше {timeout:.0f} с и была остановлена "
+                        "(для программ с окном используй wait=false)") from None
+    output = (winapi.decode_output(result.stdout) + winapi.decode_output(result.stderr)).strip()
+    if len(output) > 4000:
+        output = output[:2000] + "\n…\n" + output[-1500:]
+    return f"Код завершения {result.returncode}.\n{output or '(нет вывода)'}"
+
+
+_SKIP_DIRS = {"appdata", "node_modules", ".git", "__pycache__", ".venv", "venv", "$recycle.bin", "windows"}
+
+
+@tool(
+    "find_files",
+    "Найти файлы и папки по части имени в папках пользователя (Рабочий стол, Документы, Загрузки, "
+    "Изображения, Музыка, Видео) или в указанной папке.",
+    {
+        "name": {"type": "string", "description": "Часть имени файла, например «отчёт» или «.pdf»"},
+        "folder": {"type": "string", "description": "Где искать (необязательно): «Загрузки», полный путь"},
+    },
+    required=("name",),
+)
+def find_files(ctx: CallContext, name: str, folder: str = "") -> str:
+    query = name.strip().strip("*").lower()
+    if not query:
+        raise ToolError("не указано, что искать")
+    if folder.strip():
+        roots = [_folder_path(folder)]
+    else:
+        roots = [winapi.known_folder(k) for k in ("Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos")]
+    deadline = time.monotonic() + 8
+    found: list[str] = []
+    for root in dict.fromkeys(roots):
+        if not root.is_dir():
+            continue
+        for current, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d.lower() not in _SKIP_DIRS and not d.startswith(".")]
+            for entry in dirs + files:
+                if query in entry.lower():
+                    found.append(os.path.join(current, entry))
+            if len(found) >= 30 or time.monotonic() > deadline or ctx.cancel.is_set():
+                break
+        if len(found) >= 30 or time.monotonic() > deadline:
+            break
+    if not found:
+        return f"Ничего не найдено по запросу «{name}»."
+    return f"Найдено {len(found)}{'+' if len(found) >= 30 else ''}:\n" + "\n".join(found[:30])
+
+
+# ═══ Полезное ════════════════════════════════════════════════════════
+
+@tool(
+    "clipboard",
+    "Буфер обмена: action=get — прочитать текст из буфера (например, чтобы перевести или исправить "
+    "скопированное), action=set — положить текст в буфер (пользователь вставит его Ctrl+V).",
+    {
+        "action": {"type": "string", "enum": ["get", "set"], "description": "get — прочитать, set — записать"},
+        "text": {"type": "string", "description": "Текст для action=set"},
+    },
+    required=("action",),
+    quick=lambda args: args.get("action") == "set",
+)
+def clipboard(ctx: CallContext, action: str, text: str = "") -> str:
+    if action == "set":
+        winapi.set_clipboard_text(text)
+        return f"Скопировал в буфер обмена ({len(text)} символов)."
+    content = winapi.get_clipboard_text()
+    if not content:
+        return "Буфер обмена пуст (или в нём не текст)."
+    if len(content) > MAX_READ_CHARS:
+        content = content[:MAX_READ_CHARS] + "\n…(обрезано)"
+    return f"В буфере обмена:\n{content}"
+
+
+_CALC_NAMES = {name: getattr(__import__("math"), name) for name in
+               ("sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "log", "log10", "log2", "exp", "pi", "e",
+                "floor", "ceil", "factorial", "radians", "degrees", "hypot")}
+_CALC_NAMES.update({"abs": abs, "round": round, "min": min, "max": max})
+
+
+def safe_eval(expression: str) -> float | int:
+    """Арифметика без exec: числа, + − × ÷, степени, скобки и функции math."""
+    import ast
+    import operator
+
+    operators = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
+                 ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod, ast.Pow: operator.pow,
+                 ast.USub: operator.neg, ast.UAdd: operator.pos}
+    text = expression.strip().replace("^", "**").replace("×", "*").replace("÷", "/").replace("−", "-")
+    text = re.sub(r"(\d),(\d)", r"\1.\2", text)
+    text = re.sub(r"(\d+(?:\.\d+)?)\s*%", r"(\1/100)", text)
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError:
+        raise ToolError(f"не понял выражение «{expression}»") from None
+
+    def walk(node):
+        if isinstance(node, ast.Expression):
+            return walk(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in operators:
+            left, right = walk(node.left), walk(node.right)
+            if isinstance(node.op, ast.Pow) and (abs(right) > 1000 or abs(left) > 1e100):
+                raise ToolError("слишком большая степень")
+            return operators[type(node.op)](left, right)
+        if isinstance(node, ast.UnaryOp) and type(node.op) in operators:
+            return operators[type(node.op)](walk(node.operand))
+        if isinstance(node, ast.Name) and node.id in _CALC_NAMES and not callable(_CALC_NAMES[node.id]):
+            return _CALC_NAMES[node.id]
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _CALC_NAMES
+                and not node.keywords):
+            args = [walk(a) for a in node.args]
+            if node.func.id == "factorial" and (not args or args[0] > 1000):
+                raise ToolError("слишком большой факториал")
+            return _CALC_NAMES[node.func.id](*args)
+        raise ToolError(f"в выражении допустимы только числа, + − × ÷ ^, скобки и функции math: «{expression}»")
+
+    try:
+        return walk(tree)
+    except ZeroDivisionError:
+        raise ToolError("деление на ноль") from None
+    except (ValueError, OverflowError, TypeError) as exc:
+        raise ToolError(f"не удалось вычислить: {exc}") from None
+
+
+def format_number(value: float | int) -> str:
+    if isinstance(value, float) and value.is_integer() and abs(value) < 1e15:
+        value = int(value)
+    if isinstance(value, int):
+        return f"{value:,}".replace(",", " ")
+    return f"{value:.10g}".replace(".", ",")
+
+
+@tool(
+    "calculate",
+    "Точно вычислить арифметическое выражение (проценты, степени, корни, тригонометрия). Используй для "
+    "любых расчётов вместо подсчёта в уме, например «2500*1.15», «sqrt(2)», «15% * 3000».",
+    {"expression": {"type": "string", "description": "Выражение, например (120+80)*1.2 или 2^10"}},
+    required=("expression",),
+)
+def calculate(ctx: CallContext, expression: str) -> str:
+    return f"{expression.strip()} = {format_number(safe_eval(expression))}"
+
+
+def _wind(kmph: Any) -> str:
+    try:
+        return f"{float(kmph) / 3.6:.0f} м/с"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _signed(value: Any) -> str:
+    try:
+        number = round(float(value))
+    except (TypeError, ValueError):
+        return str(value)
+    return f"+{number}" if number > 0 else str(number)
+
+
+def _weather_desc(item: dict) -> str:
+    for key in ("lang_ru", "weatherDesc"):
+        values = item.get(key) or []
+        if values and values[0].get("value"):
+            return str(values[0]["value"]).strip().lower()
+    return ""
+
+
+@tool(
+    "weather",
+    "Погода сейчас и прогноз на сегодня и завтра. Без города — по местоположению компьютера.",
+    {"city": {"type": "string", "description": "Город, например «Москва» (необязательно)"}},
+)
+def weather(ctx: CallContext, city: str = "") -> str:
+    import httpx
+
+    place = urllib.parse.quote(city.strip())
+    try:
+        response = httpx.get(f"https://wttr.in/{place}", params={"format": "j1", "lang": "ru"}, timeout=12,
+                             headers={"User-Agent": "Jarvis-assistant"}, follow_redirects=True)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        raise ToolError(f"не удалось получить погоду (wttr.in): {exc}") from None
+    try:
+        now = data["current_condition"][0]
+        area = data.get("nearest_area") or [{}]
+        name = city.strip() or (area[0].get("areaName") or [{}])[0].get("value", "")
+        parts = [f"Погода{': ' + name if name else ''}. Сейчас {_signed(now.get('temp_C'))}°C "
+                 f"(ощущается как {_signed(now.get('FeelsLikeC'))}°C), {_weather_desc(now)}, "
+                 f"ветер {_wind(now.get('windspeedKmph'))}, влажность {now.get('humidity')}%."]
+        for title, day in zip(("Сегодня", "Завтра"), (data.get("weather") or [])[:2]):
+            hourly = day.get("hourly") or []
+            rain = max((int(h.get("chanceofrain") or 0) for h in hourly), default=0)
+            middle = hourly[len(hourly) // 2] if hourly else {}
+            parts.append(f"{title} от {_signed(day.get('mintempC'))} до {_signed(day.get('maxtempC'))}°C, "
+                         f"{_weather_desc(middle) or 'без описания'}, вероятность дождя до {rain}%.")
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise ToolError(f"сервис погоды вернул непонятный ответ: {exc}") from None
+    return " ".join(parts)
+
+
+# ═══ Окна ════════════════════════════════════════════════════════════
+
+def _app_windows() -> list[tuple[int, str, str]]:
+    """Окна программ: (hwnd, заголовок, процесс), без окна самого Джарвиса."""
+    own = os.getpid()
+    result = []
+    for hwnd in winapi.top_windows():
+        title = winapi.window_title(hwnd).strip()
+        pid = winapi.window_pid(hwnd)
+        if not title or pid == own or winapi.window_class(hwnd) in ("Progman", "Shell_TrayWnd", "WorkerW"):
+            continue
+        try:
+            process = psutil.Process(pid).name()
+        except psutil.Error:
+            process = "?"
+        result.append((hwnd, title, process))
+    return result
+
+
+@tool("list_windows", "Список открытых окон программ (заголовок и процесс).")
+def list_windows(ctx: CallContext) -> str:
+    winapi._require_windows()
+    windows = _app_windows()
+    if not windows:
+        return "Открытых окон нет."
+    return "Открытые окна:\n" + "\n".join(f"- {title} ({process})" for _hwnd, title, process in windows[:40])
+
+
+def find_window(name: str) -> tuple[int, str] | None:
+    query = normalize(clean_app_name(name) or name)
+    best: tuple[float, int, str] | None = None
+    for hwnd, title, process in _app_windows():
+        stem = process.lower().removesuffix(".exe")
+        score = max(app_name_score(query, title), app_name_score(query, stem))
+        if best is None or score > best[0]:
+            best = (score, hwnd, title)
+    return (best[1], best[2]) if best and best[0] >= 0.75 else None
+
+
+_WINDOW_ACTIONS = {"focus": "Переключился на окно", "minimize": "Свернул окно", "maximize": "Развернул окно",
+                   "restore": "Восстановил окно"}
+
+
+@tool(
+    "window_action",
+    "Действие с окном программы: focus — переключиться на него, minimize — свернуть, maximize — "
+    "развернуть на весь экран, restore — восстановить. Окно ищется по названию программы или заголовку.",
+    {
+        "name": {"type": "string", "description": "Программа или часть заголовка окна, например «хром», «Блокнот»"},
+        "action": {"type": "string", "enum": list(_WINDOW_ACTIONS), "description": "Что сделать с окном"},
+    },
+    required=("name", "action"),
+    quick=True,
+)
+def window_action(ctx: CallContext, name: str, action: str) -> str:
+    winapi._require_windows()
+    found = find_window(name)
+    if found is None:
+        raise ToolError(f"не нашёл открытое окно «{name}» (list_windows покажет, какие окна открыты)")
+    hwnd, title = found
+    if action == "focus":
+        if not winapi.activate_window(hwnd, timeout=2):
+            raise ToolError(f"Windows не дала переключиться на окно «{title}»")
+    else:
+        command = {"minimize": winapi.SW_MINIMIZE, "maximize": winapi.SW_MAXIMIZE, "restore": winapi.SW_RESTORE}[action]
+        winapi.show_window(hwnd, command)
+    return f"{_WINDOW_ACTIONS[action]} «{title}»."

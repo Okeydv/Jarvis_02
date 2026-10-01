@@ -81,6 +81,21 @@ if IS_WINDOWS:
                                              ctypes.POINTER(ctypes.c_void_p)]
     shell32.SHGetKnownFolderPath.restype = ctypes.c_long
     ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.CloseClipboard.restype = wintypes.BOOL
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.restype = wintypes.HGLOBAL
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_EXTENDEDKEY = 0x0001
@@ -93,6 +108,11 @@ WM_SYSCOMMAND = 0x0112
 SC_CLOSE = 0xF060
 SW_RESTORE = 9
 GW_OWNER = 4
+
+SW_MAXIMIZE = 3
+SW_MINIMIZE = 6
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
 
 VK_MEDIA_NEXT_TRACK = 0xB0
 VK_MEDIA_PREV_TRACK = 0xB1
@@ -237,6 +257,61 @@ def system_close_window(hwnd: int) -> None:
     """То же, что Alt+F4 для конкретного окна (WM_SYSCOMMAND / SC_CLOSE)."""
     if is_window(hwnd):
         user32.PostMessageW(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0)
+
+
+def show_window(hwnd: int, command: int) -> bool:
+    """Свернуть (SW_MINIMIZE), развернуть (SW_MAXIMIZE) или восстановить (SW_RESTORE) окно."""
+    if not is_window(hwnd):
+        return False
+    user32.ShowWindow(hwnd, command)
+    return True
+
+
+# ─── Буфер обмена ─────────────────────────────────────────────────────
+
+def _open_clipboard() -> None:
+    for _ in range(20):  # буфер может быть ненадолго занят другой программой
+        if user32.OpenClipboard(None):
+            return
+        time.sleep(0.05)
+    raise OSError("буфер обмена занят другой программой")
+
+
+def get_clipboard_text() -> str:
+    _require_windows()
+    _open_clipboard()
+    try:
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return ""
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            return ""
+        try:
+            return ctypes.wstring_at(pointer)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+def set_clipboard_text(text: str) -> None:
+    _require_windows()
+    data = (text.replace("\r\n", "\n").replace("\n", "\r\n") + "\0").encode("utf-16-le")
+    handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+    if not handle:
+        raise OSError("не удалось выделить память для буфера обмена")
+    pointer = kernel32.GlobalLock(handle)
+    ctypes.memmove(pointer, data, len(data))
+    kernel32.GlobalUnlock(handle)
+    _open_clipboard()
+    try:
+        user32.EmptyClipboard()
+        if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+            kernel32.GlobalFree(handle)
+            raise OSError(f"SetClipboardData не сработал (код {ctypes.get_last_error()})")
+    finally:
+        user32.CloseClipboard()
 
 
 class FocusTracker:

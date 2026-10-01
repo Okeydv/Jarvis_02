@@ -1,6 +1,7 @@
 """Логика распознавания без настоящего микрофона: выбор устройства, уровень, тишина, слово «Джарвис»."""
 
 import sys
+import threading
 import time
 import types
 
@@ -19,13 +20,16 @@ DEVICES = [
     {"name": "Первичный драйвер записи звука", "hostapi": 1, "max_input_channels": 2, "default_samplerate": 44100},
     {"name": "Микрофон (USB Audio)", "hostapi": 1, "max_input_channels": 1, "default_samplerate": 48000},
     {"name": "Микрофон (USB Audio)", "hostapi": 2, "max_input_channels": 1, "default_samplerate": 48000},
+    {"name": "Микрофон (USB Audio)", "hostapi": 3, "max_input_channels": 1, "default_samplerate": 48000},
 ]
+HOSTAPIS = [{"name": "MME"}, {"name": "Windows DirectSound"}, {"name": "Windows WASAPI"}, {"name": "Windows WDM-KS"}]
 
 
 @pytest.fixture
 def fake_sd(monkeypatch):
     module = types.SimpleNamespace(
         query_devices=lambda device=None, kind=None: DEVICES if device is None else DEVICES[device],
+        query_hostapis=lambda index=None: HOSTAPIS if index is None else HOSTAPIS[index],
         default=types.SimpleNamespace(hostapi=0, device=(1, 3)),
     )
     monkeypatch.setitem(sys.modules, "sounddevice", module)
@@ -56,7 +60,7 @@ def test_level_scale():
 
 
 def test_microphone_list_for_settings(fake_sd):
-    devices = list_input_devices()
+    devices = list_input_devices()  # только основной звуковой API, без дублей и «переназначения»
     assert [d["name"] for d in devices] == ["Микрофон (Realtek Audio)", "Микрофон (USB Audio)"]
     assert devices[0] == {"index": 1, "name": "Микрофон (Realtek Audio)", "default": True}
     assert devices[1]["default"] is False
@@ -65,19 +69,20 @@ def test_microphone_list_for_settings(fake_sd):
 def test_device_candidates(config, fake_sd):
     events = Events()
     listener = events.listener(config)
-    assert listener._candidates() == [None]  # по умолчанию — системный микрофон
+    # по умолчанию — системный микрофон, затем он же в других звуковых API
+    assert listener._candidates() == [None, 4]
 
     config.set("voice.input_device", "Микрофон (USB Audio)")
-    # сначала из основного звукового API, затем остальные, в конце — системный по умолчанию
-    assert listener._candidates() == [2, 6, 7, None]
+    # сначала из основного звукового API, затем остальные (кроме WDM-KS), в конце — системный
+    assert listener._candidates() == [2, 6, 7, None, 4]
     config.set("voice.input_device", "usb")
-    assert listener._candidates() == [2, 6, 7, None]
+    assert listener._candidates() == [2, 6, 7, None, 4]
     config.set("voice.input_device", 4)
     assert listener._candidates() == [4, None]
 
     config.set("voice.input_device", "Гарнитура Bluetooth")
-    assert listener._candidates() == [None]
-    assert listener._candidates() == [None]
+    assert listener._candidates() == [None, 4]
+    assert listener._candidates() == [None, 4]
     assert len(events.errors) == 1 and "не найден" in events.errors[0][0]  # предупреждение — один раз
 
 
@@ -180,3 +185,39 @@ def test_microphone_test_phrase_is_not_a_command(config):
     listener._probing = 0
     listener._deliver("джарвис открой браузер")
     assert events.finals == [("джарвис открой браузер", "wake", False)]
+
+
+def test_open_failure_is_reported_once_and_retried_slowly(config, fake_sd, monkeypatch):
+    events = Events()
+    listener = events.listener(config)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("Error opening RawInputStream: Unanticipated host error [MME error 1]")
+
+    fake_sd.RawInputStream = broken
+    listener._vosk = object()
+    listener._continuous = True
+    thread = threading.Thread(target=listener._run, daemon=True)
+    thread.start()
+    time.sleep(1.0)
+    listener._stop.set()
+    listener._wake.set()
+    thread.join(5)
+    assert len(events.errors) == 1 and "Не удалось открыть микрофон" in events.errors[0][0]
+    assert PRIVACY_HINT in events.errors[0][1]
+    assert not listener._continuous  # слушать перестал, а не долбит устройство
+
+
+def test_probe_fails_fast_when_microphone_does_not_open(config):
+    listener = Events().listener(config)
+    listener.available = True
+    listener._open_error = None
+
+    def fake_wake():
+        listener._open_error = stt.VoiceError("Не удалось открыть микрофон.", PRIVACY_HINT)
+
+    listener._wake = types.SimpleNamespace(set=fake_wake)
+    started = time.monotonic()
+    with pytest.raises(stt.VoiceError):
+        listener.probe(5.0)
+    assert time.monotonic() - started < 1.0 and listener._probing == 0

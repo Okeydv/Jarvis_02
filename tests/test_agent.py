@@ -152,3 +152,95 @@ def test_trim_history_keeps_current_request():
     window = trim_history(history, 20)
     assert window[0]["content"] == "новое"
     assert trim_history([], 20) == []
+
+
+def test_simple_action_is_answered_without_second_model_call(config, monkeypatch, tmp_path):
+    from jarvis import winapi
+
+    monkeypatch.setattr(winapi, "known_folder", lambda name: tmp_path / name)
+    agent, backend, events = make_agent(config, [
+        AssistantTurn(tool_calls=[ToolCall(name="note", arguments={"text": "купить молоко"})]),
+    ])
+    outcome = agent.run("Запиши заметку купить молоко", threading.Event())
+    assert len(backend.calls) == 1 and outcome.fast  # модель вызвана один раз
+    assert outcome.text.startswith("Готово, сэр. Заметка сохранена")
+    assert events.text.strip() == outcome.text  # ответ показан и озвучен
+    assert agent.history[-1] == {"role": "assistant", "content": outcome.text}
+
+
+def test_multi_step_request_goes_back_to_model(config, monkeypatch, tmp_path):
+    from jarvis import winapi
+
+    monkeypatch.setattr(winapi, "known_folder", lambda name: tmp_path / name)
+    agent, backend, events = make_agent(config, [
+        AssistantTurn(tool_calls=[ToolCall(name="note", arguments={"text": "купить молоко"})]),
+        AssistantTurn(text="Записал и проверил, сэр."),
+    ])
+    outcome = agent.run("Запиши заметку и скажи, что записал", threading.Event())
+    assert len(backend.calls) == 2 and not outcome.fast
+
+
+def test_fast_replies_can_be_disabled(config, monkeypatch, tmp_path):
+    from jarvis import winapi
+
+    monkeypatch.setattr(winapi, "known_folder", lambda name: tmp_path / name)
+    config.set("llm.fast_replies", False)
+    agent, backend, events = make_agent(config, [
+        AssistantTurn(tool_calls=[ToolCall(name="note", arguments={"text": "x"})]),
+        AssistantTurn(text="Готово."),
+    ])
+    agent.run("Запиши заметку икс", threading.Event())
+    assert len(backend.calls) == 2
+
+
+def test_cancelled_action_gets_short_reply(config):
+    agent, backend, events = make_agent(config, [
+        AssistantTurn(tool_calls=[ToolCall(name="shutdown_pc", arguments={})]),
+    ])
+    outcome = agent.run("Выключи компьютер", threading.Event())  # подтверждать некому — отмена
+    assert outcome.fast and outcome.text == "Как скажете, сэр, отменяю."
+    assert events.tools[0][1] == "cancelled"
+
+
+def test_questions_still_go_to_model(config):
+    agent, backend, events = make_agent(config, [
+        AssistantTurn(tool_calls=[ToolCall(name="get_datetime", arguments={})]),
+        AssistantTurn(text="Сейчас утро, сэр."),
+    ])
+    outcome = agent.run("Сколько дней до нового года", threading.Event())
+    assert len(backend.calls) == 2 and outcome.text == "Сейчас утро, сэр."
+
+
+def test_single_action_detection_and_speakable_reply():
+    from jarvis.agent import is_single_action, quick_reply
+    from jarvis.tools import ToolResult
+
+    assert is_single_action("Открой блокнот")
+    assert is_single_action("Сделай погромче")
+    assert not is_single_action("Открой блокнот и напиши привет")
+    assert not is_single_action("Открой ютуб, потом включи музыку")
+    assert not is_single_action("Сделай скриншот, а потом открой его")
+    reply = quick_reply([ToolResult("ok", "Запущено «блокнот» (notepad.exe).")], said_something=False)
+    assert reply == "Готово, сэр. Запущено «блокнот»."
+    assert quick_reply([ToolResult("ok", "Громкость установлена на 30%.")], said_something=True) == \
+        "Громкость установлена на 30%."
+
+
+def test_old_long_tool_results_are_compacted(config):
+    from jarvis.agent import compact_history
+
+    code = "print('x')\n" * 200
+    call = ToolCall(name="write_file", arguments={"path": "a.py", "content": code}, id="c1")
+    history = [
+        {"role": "user", "content": "Напиши программу"},
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "c1", "name": "write_file", "content": "Файл сохранён. " + "x" * 2000},
+        {"role": "assistant", "content": "Готово."},
+        {"role": "user", "content": "Прочитай файл"},
+        {"role": "tool", "tool_call_id": "c2", "name": "read_file", "content": "y" * 3000},
+    ]
+    window = compact_history(history)
+    assert len(window[1]["tool_calls"][0].arguments["content"]) < 400
+    assert window[1]["tool_calls"][0].id == "c1" and call.arguments["content"] == code  # оригинал не тронут
+    assert "сокращено" in window[2]["content"] and len(window[2]["content"]) < 600
+    assert window[5]["content"] == "y" * 3000  # текущий запрос — целиком

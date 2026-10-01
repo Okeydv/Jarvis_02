@@ -7,9 +7,12 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
+import re
+
 from .config import DEFAULT_SYSTEM_PROMPT
 from .llm.base import LLMBackend, LLMError, ToolCall
-from .tools import ToolRegistry, ToolResult
+from .text_utils import normalize
+from .tools import TOOLS, ToolRegistry, ToolResult
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +35,68 @@ class AgentOutcome:
     tool_failures: int = 0
     cancelled: bool = False
     failed: bool = False
+    fast: bool = False  # ответ дан сразу по результату действия, без второго запроса к модели
+
+
+# Признаки просьбы из нескольких шагов: «открой блокнот и напиши…», «…, потом…»
+_MULTI_STEP_RE = re.compile(r"(^|\s)(и|потом|затем|после|также|ещё|еще|а)(\s|$)")
+
+
+def is_single_action(text: str) -> bool:
+    """Похоже ли сказанное на одно действие («открой браузер», «громче»)."""
+    if "," in text or ";" in text:
+        return False
+    return not _MULTI_STEP_RE.search(normalize(text))
+
+
+def _speakable(text: str) -> str:
+    """Убирает технические подробности в скобках: «(notepad.exe)», «(https://…)»."""
+    return re.sub(r"\s*\([^()]*[A-Za-z\\/][^()]*\)", "", text).strip()
+
+
+def quick_reply(results: list[ToolResult], said_something: bool) -> str:
+    parts: list[str] = []
+    for result in results:
+        text = "Как скажете, сэр, отменяю." if result.status == "cancelled" else _speakable(result.text)
+        if text and text not in parts:
+            parts.append(text)
+    reply = " ".join(parts)
+    if not said_something and all(r.ok for r in results):
+        reply = f"Готово, сэр. {reply}".strip()
+    return reply
+
+
+_SHORT_TOOL_RESULT = 600
+_SHORT_ARGUMENT = 400
+
+
+def compact_history(window: list[dict]) -> list[dict]:
+    """Старые длинные результаты инструментов и аргументы (например, код в write_file) сокращаются:
+    запрос к модели становится короче, а ответ — быстрее. Текущий запрос не трогаем."""
+    last_user = max((i for i, m in enumerate(window) if m["role"] == "user"), default=0)
+    result = []
+    for index, message in enumerate(window):
+        if index >= last_user:
+            result.append(message)
+            continue
+        if message["role"] == "tool" and len(message.get("content") or "") > _SHORT_TOOL_RESULT:
+            content = message["content"]
+            message = {**message, "content": content[:_SHORT_TOOL_RESULT - 100] + f"…(сокращено, всего {len(content)} символов)"}
+        elif message["role"] == "assistant" and message.get("tool_calls"):
+            calls = []
+            changed = False
+            for call in message["tool_calls"]:
+                arguments = {}
+                for key, value in call.arguments.items():
+                    if isinstance(value, str) and len(value) > _SHORT_ARGUMENT:
+                        value = value[:_SHORT_ARGUMENT - 100] + f"…(сокращено, всего {len(value)} символов)"
+                        changed = True
+                    arguments[key] = value
+                calls.append(ToolCall(name=call.name, arguments=arguments, id=call.id))
+            if changed:
+                message = {**message, "tool_calls": calls}
+        result.append(message)
+    return result
 
 
 def trim_history(history: list[dict], limit: int) -> list[dict]:
@@ -102,7 +167,7 @@ class Agent:
             allow_tools = step < max_steps - 1  # последний шаг — только текстовый ответ
             self.events.on_state("thinking")
             with self._lock:
-                window = trim_history(self.history, limit)
+                window = compact_history(trim_history(self.history, limit))
             try:
                 turn = backend.stream_chat(system, window, tools, allow_tools, cancel, self.events.on_text)
             except LLMError as exc:
@@ -135,6 +200,7 @@ class Agent:
                 break
 
             self.events.on_state("executing")
+            results: list[ToolResult] = []
             for call in calls:
                 if cancel.is_set():
                     result = ToolResult("cancelled", "Отменено пользователем.")
@@ -143,11 +209,34 @@ class Agent:
                     self.events.on_tool_start(call)
                     result = self.registry.execute(call.name, call.arguments, cancel)
                     self.events.on_tool_result(call, result)
+                results.append(result)
                 self._append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": result.text})
                 outcome.tools_used += 1
                 if not result.ok:
                     outcome.tool_failures += 1
 
+            if self._can_answer_now(user_text, calls, results, cancel):
+                # Простое действие выполнено — результат и есть ответ: второй запрос к модели
+                # занял бы ещё несколько секунд (на локальной модели — десятки).
+                reply = quick_reply(results, said_something=bool(turn.text.strip()))
+                self.events.on_text(reply)
+                self.events.on_turn_end()
+                self._append({"role": "assistant", "content": reply})
+                outcome.text, outcome.fast = reply, True
+                break
+
         outcome.cancelled = cancel.is_set()
         self._truncate()
         return outcome
+
+    def _can_answer_now(self, user_text: str, calls: list[ToolCall], results: list[ToolResult],
+                        cancel: threading.Event) -> bool:
+        if cancel.is_set() or not self.config.get("llm.fast_replies", True) or not is_single_action(user_text):
+            return False
+        if any(r.status == "error" for r in results):
+            return False  # ошибку модель объяснит и, может быть, исправит
+        for call in calls:
+            tool = TOOLS.get(call.name)
+            if tool is None or not tool.is_quick(call.arguments if isinstance(call.arguments, dict) else {}):
+                return False
+        return True

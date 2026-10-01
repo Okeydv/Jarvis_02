@@ -336,6 +336,9 @@ class JarvisApp:
         if "tools.allow_powershell" in changes:
             self.ui.post("system", "Команды PowerShell разрешены — каждую нужно будет подтвердить."
                          if changes["tools.allow_powershell"] else "Команды PowerShell запрещены.")
+        if "tools.allow_code" in changes:
+            self.ui.post("system", "Запуск кода Python разрешён — каждый запуск нужно будет подтвердить."
+                         if changes["tools.allow_code"] else "Запуск кода запрещён (писать код в файлы Джарвис может).")
         log.info("Настройки изменены: %s", ", ".join(changes))
 
     def save_secrets(self, secrets: dict[str, str]) -> None:

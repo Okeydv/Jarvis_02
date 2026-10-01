@@ -66,7 +66,7 @@ def test_ollama_messages_and_stream(config):
     assert "".join(pieces) == "Открываю."
     assert turn.tool_calls[0].name == "open_app" and turn.tool_calls[0].arguments == {"name": "блокнот"}
     assert captured["think"] is False and captured["stream"] is True
-    assert captured["model"] == "qwen3:8b" and captured["options"]["num_ctx"] == 8192
+    assert captured["model"] == "qwen3:8b" and captured["options"]["num_ctx"] == 12288
 
     turn = backend.stream_chat("SYS", [{"role": "user", "content": "x"}], TOOL_SCHEMAS, False, threading.Event(), lambda d: None)
     assert "tools" not in captured and turn.tool_calls == []

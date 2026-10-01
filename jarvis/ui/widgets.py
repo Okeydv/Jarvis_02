@@ -10,6 +10,7 @@ from typing import Callable
 
 import customtkinter as ctk
 
+from ..text_utils import split_code_blocks
 from . import theme
 
 
@@ -183,6 +184,8 @@ class Bubble(ctk.CTkFrame):
         bg, border, fg, title_color = self.STYLES[role]
         super().__init__(master, fg_color=bg, corner_radius=16, border_width=1, border_color=border)
         self.text = text
+        self.fonts, self._fg, self._wrap = fonts, fg, wrap
+        self._parts: list = []  # подписи и блоки кода после render_rich()
         self._header = ctk.CTkLabel(self, text=title, font=fonts.tiny_bold, text_color=title_color, anchor="w", height=16)
         self._header.pack(fill="x", padx=14, pady=(8, 0))
         body_font = fonts.mono if role == "report" else fonts.body
@@ -206,9 +209,34 @@ class Bubble(ctk.CTkFrame):
         self.body.configure(text=text)
 
     def set_wrap(self, wrap: int) -> None:
-        self.body.configure(wraplength=wrap)
+        self._wrap = wrap
+        if self.body.winfo_exists():
+            self.body.configure(wraplength=wrap)
         if self.hint is not None:
             self.hint.configure(wraplength=wrap)
+        for part in self._parts:
+            if isinstance(part, CodeBlock):
+                part.set_width(wrap)
+            else:
+                part.configure(wraplength=wrap)
+
+    def render_rich(self) -> None:
+        """Когда ответ готов: блоки ```кода``` показываются моноширинным шрифтом с кнопкой «Копировать»."""
+        parts = split_code_blocks(self.text)
+        if not any(kind == "code" for kind, _content, _lang in parts):
+            return
+        self.body.destroy()
+        for kind, content, language in parts:
+            if kind == "code":
+                block = CodeBlock(self, content, language, self.fonts, self._wrap)
+                block.pack(fill="x", padx=10, pady=4)
+            else:
+                block = ctk.CTkLabel(self, text=content, font=self.fonts.body, text_color=self._fg, justify="left",
+                                     anchor="w", wraplength=self._wrap)
+                block.pack(fill="x", padx=14, pady=(2, 4))
+                block.bind("<Button-3>", self._menu)
+            self._parts.append(block)
+        ctk.CTkFrame(self, fg_color="transparent", height=6).pack()
 
     def _menu(self, event) -> None:
         menu = tk.Menu(self, tearoff=0)
@@ -218,6 +246,41 @@ class Bubble(ctk.CTkFrame):
     def _copy(self) -> None:
         self.clipboard_clear()
         self.clipboard_append(self.text)
+
+
+class CodeBlock(ctk.CTkFrame):
+    """Блок кода в ответе: язык, кнопка «Копировать», моноширинный текст с прокруткой."""
+
+    MAX_LINES = 22
+
+    def __init__(self, master, code: str, language: str, fonts: theme.Fonts, width: int):
+        super().__init__(master, fg_color=theme.CODE_BG, corner_radius=10, border_width=1, border_color=theme.BORDER)
+        self.code = code
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(6, 0))
+        ctk.CTkLabel(top, text=(language or "код").upper(), font=fonts.tiny_bold, text_color=theme.MUTED,
+                     height=16).pack(side="left")
+        self.copy_button = ctk.CTkButton(top, text="Копировать", width=96, height=24, corner_radius=8,
+                                         font=fonts.small, fg_color=theme.SECONDARY,
+                                         hover_color=theme.SECONDARY_HOVER, text_color=theme.TEXT,
+                                         command=self._copy)
+        self.copy_button.pack(side="right")
+        lines = code.count("\n") + 1
+        self.box = ctk.CTkTextbox(self, font=fonts.mono, wrap="none", fg_color=theme.CODE_BG, text_color=theme.TEXT,
+                                  width=width, height=min(lines, self.MAX_LINES) * 17 + 14, border_width=0,
+                                  activate_scrollbars=lines > self.MAX_LINES or max(map(len, code.split("\n"))) > 70)
+        self.box.insert("1.0", code)
+        self.box.configure(state="disabled")
+        self.box.pack(fill="x", padx=4, pady=(2, 6))
+
+    def set_width(self, width: int) -> None:
+        self.box.configure(width=width)
+
+    def _copy(self) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(self.code)
+        self.copy_button.configure(text="Скопировано")
+        self.after(1500, lambda: self.copy_button.winfo_exists() and self.copy_button.configure(text="Копировать"))
 
 
 class ChatView(ctk.CTkScrollableFrame):
@@ -232,17 +295,23 @@ class ChatView(ctk.CTkScrollableFrame):
         self._rows: deque = deque()
         self._bubbles: list[Bubble] = []
         self._wrap = 520
+        self._wide = 600  # ширина строки для системных сообщений
+        self._notes: list[ctk.CTkLabel] = []
         self._scroll_pending = False
         self._parent_canvas.bind("<Configure>", self._on_resize, add="+")
 
     def _on_resize(self, event) -> None:
         scaling = self._get_widget_scaling()
-        wrap = max(220, int(event.width / scaling * 0.68))
+        width = event.width / scaling
+        wrap = max(220, int(width * 0.68))
         if abs(wrap - self._wrap) > 8:
             at_bottom = self._parent_canvas.yview()[1] >= 0.98
             self._wrap = wrap
+            self._wide = max(200, int(width) - 50)
             for bubble in self._bubbles:
                 bubble.set_wrap(wrap)
+            for note in self._notes:
+                note.configure(wraplength=self._wide)
             if at_bottom:
                 self.scroll_to_end()
 
@@ -253,6 +322,7 @@ class ChatView(ctk.CTkScrollableFrame):
         while len(self._rows) > self.MAX_ROWS:
             old = self._rows.popleft()
             self._bubbles = [b for b in self._bubbles if b.master is not old]
+            self._notes = [n for n in self._notes if n.master is not old]
             old.destroy()
         return row
 
@@ -281,8 +351,10 @@ class ChatView(ctk.CTkScrollableFrame):
 
     def add_system(self, text: str) -> None:
         row = self._row()
-        ctk.CTkLabel(row, text=text, font=self.fonts.small, text_color=theme.MUTED, wraplength=self._wrap + 120,
-                     justify="center").pack(pady=2)
+        note = ctk.CTkLabel(row, text=text, font=self.fonts.small, text_color=theme.MUTED, wraplength=self._wide,
+                            justify="center")
+        note.pack(pady=2)
+        self._notes.append(note)
         self.scroll_to_end()
 
     def clear(self) -> None:
@@ -290,6 +362,7 @@ class ChatView(ctk.CTkScrollableFrame):
             row.destroy()
         self._rows.clear()
         self._bubbles.clear()
+        self._notes.clear()
 
     def scroll_to_end(self) -> None:
         """Автопрокрутка к последнему сообщению (запросы во время потокового ответа объединяются)."""

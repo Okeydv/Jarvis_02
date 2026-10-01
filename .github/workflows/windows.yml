@@ -81,8 +81,24 @@ jobs:
           Start-Sleep -Seconds 5
           Restart-Service Audiosrv -Force
           Get-CimInstance Win32_SoundDevice | Format-Table Name, Status -AutoSize
+      - name: Доступ классических программ к микрофону (как в «Параметры → Конфиденциальность → Микрофон»)
+        run: |
+          $keys = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone",
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged")
+          foreach ($key in $keys) {
+            New-Item -Path $key -Force | Out-Null
+            Set-ItemProperty -Path $key -Name Value -Value "Allow" -Type String
+          }
+          $policy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy"
+          New-Item -Path $policy -Force | Out-Null
+          Set-ItemProperty -Path $policy -Name LetAppsAccessMicrophone -Value 1 -Type DWord
+          Restart-Service Audiosrv -Force
       - name: Звуковые устройства
-        run: python -c "import sounddevice as sd; print(sd.query_devices()); print('по умолчанию:', sd.default.device)"
+        run: |
+          python -c "import sounddevice as sd; print(sd.query_devices()); print('по умолчанию:', sd.default.device)"
+          python -c "import sounddevice as sd`ntry:`n    s = sd.RawInputStream(samplerate=44100, channels=1, dtype='int16'); s.start(); print('Микрофон по умолчанию открывается:', s.device); s.close()`nexcept Exception as e:`n    print('Микрофон по умолчанию НЕ открывается:', e)"
       - name: Проверки на Windows (tests/windows)
         env:
           JARVIS_WINDOWS_E2E: "1"
@@ -105,7 +121,7 @@ jobs:
   ollama:
     name: Настоящая модель (Ollama) управляет Windows
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 50
     env:
       JARVIS_OLLAMA_MODEL: qwen3:4b
     steps:
@@ -120,7 +136,9 @@ jobs:
         run: |
           $installer = Join-Path $env:RUNNER_TEMP "OllamaSetup.exe"
           Invoke-WebRequest "https://ollama.com/download/OllamaSetup.exe" -OutFile $installer
-          Start-Process $installer -ArgumentList "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES" -Wait
+          # -Wait в PowerShell 7 ждёт и запущенную установщиком Ollama — ждём только сам установщик
+          $setup = Start-Process $installer -ArgumentList "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES" -PassThru
+          if (-not $setup.WaitForExit(600000)) { throw "Установщик Ollama не завершился за 10 минут" }
           $ollama = Join-Path $env:LOCALAPPDATA "Programs\Ollama\ollama.exe"
           $ready = $false
           for ($i = 0; $i -lt 30 -and -not $ready; $i++) {

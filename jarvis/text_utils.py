@@ -112,16 +112,40 @@ def contains_stop_word(text: str, stop_words: Iterable[str]) -> bool:
 _BOUNDARY_RE = re.compile(r"[.!?…]+[\"»”’)\]]*(?=\s)|\n+")
 
 
+CODE_NOTE = "Код показан в окне."
+
+
 class SentenceSplitter:
-    """Собирает текст, приходящий кусочками, и отдаёт готовые предложения."""
+    """Собирает текст, приходящий кусочками, и отдаёт готовые предложения.
+    Блоки кода ```…``` не озвучиваются: вместо них — короткая фраза."""
 
     def __init__(self, min_len: int = 12, max_len: int = 300):
         self.min_len = min_len
         self.max_len = max_len
         self._buf = ""
+        self._raw = ""
+        self._in_code = False
+
+    def _without_code(self, chunk: str) -> str:
+        self._raw += chunk
+        out: list[str] = []
+        while True:
+            index = self._raw.find("```")
+            if index < 0:
+                # 1–2 обратные кавычки в конце могут оказаться началом ```
+                keep = min(2, len(self._raw) - len(self._raw.rstrip("`")))
+                if not self._in_code:
+                    out.append(self._raw[:len(self._raw) - keep])
+                self._raw = self._raw[len(self._raw) - keep:] if keep else ""
+                return "".join(out)
+            if not self._in_code:
+                out.append(self._raw[:index])
+                out.append(f"\n{CODE_NOTE}\n")
+            self._raw = self._raw[index + 3:]
+            self._in_code = not self._in_code
 
     def feed(self, chunk: str) -> list[str]:
-        self._buf += chunk
+        self._buf += self._without_code(chunk)
         out: list[str] = []
         start = 0
         for match in _BOUNDARY_RE.finditer(self._buf):
@@ -138,8 +162,29 @@ class SentenceSplitter:
         return out
 
     def flush(self) -> list[str]:
-        rest, self._buf = self._buf.strip(), ""
+        if not self._in_code:
+            self._buf += self._raw
+        rest, self._buf, self._raw, self._in_code = self._buf.strip(), "", "", False
         return [rest] if rest else []
+
+
+_CODE_BLOCK_RE = re.compile(r"```[ \t]*([\w+#.\-]*)[^\n]*\n?(.*?)(?:```|\Z)", re.S)
+
+
+def split_code_blocks(text: str) -> list[tuple[str, str, str]]:
+    """Текст ответа → части: ("text", текст, "") и ("code", код, язык)."""
+    parts: list[tuple[str, str, str]] = []
+    position = 0
+    for match in _CODE_BLOCK_RE.finditer(text):
+        before = text[position:match.start()].strip()
+        if before:
+            parts.append(("text", before, ""))
+        parts.append(("code", match.group(2).strip("\n"), match.group(1).lower()))
+        position = match.end()
+    rest = text[position:].strip()
+    if rest:
+        parts.append(("text", rest, ""))
+    return parts
 
 
 def _best_cut(text: str, limit: int) -> int:
@@ -477,7 +522,7 @@ def latin_to_cyrillic(text: str) -> str:
 
 
 def strip_markdown(text: str) -> str:
-    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    text = re.sub(r"```.*?(?:```|\Z)", f"\n{CODE_NOTE}\n", text, flags=re.S)
     text = re.sub(r"`([^`]*)`", r"\1", text)
     text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
