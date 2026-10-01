@@ -1380,7 +1380,8 @@ def open_in_editor(path: Path, config) -> str:
     if editor is None:
         raise ToolError("редактор кода не найден")
     title, command = editor
-    subprocess.Popen([*command, str(path)], creationflags=winapi.DETACHED_PROCESS | winapi.CREATE_NEW_PROCESS_GROUP)
+    flags = winapi.DETACHED_PROCESS | winapi.CREATE_NEW_PROCESS_GROUP if winapi.IS_WINDOWS else 0
+    subprocess.Popen([*command, str(path)], creationflags=flags)
     return title
 
 

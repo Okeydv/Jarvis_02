@@ -52,7 +52,7 @@ DEFAULTS: dict[str, Any] = {
         "model": "qwen3:8b",
         "think": False,
         "temperature": 0.4,
-        "keep_alive": "30m",
+        "keep_alive": "2h",
         "num_ctx": 12288,
         "preload": True,
     },

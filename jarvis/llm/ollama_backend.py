@@ -215,7 +215,7 @@ class OllamaBackend(LLMBackend):
             "messages": self.build_messages(system, [{"role": "user", "content": "Проверка связи."}]),
             "tools": self.build_tools(tools) if tools else None,
             "options": {**self._options(), "num_predict": 1},
-            "keep_alive": self.config.get("ollama.keep_alive", "30m"),
+            "keep_alive": self.config.get("ollama.keep_alive", "2h"),
         }
         if self._think_supported:
             kwargs["think"] = bool(self.config.get("ollama.think", False))
@@ -248,7 +248,7 @@ class OllamaBackend(LLMBackend):
             "messages": self.build_messages(system, messages),
             "stream": True,
             "options": self._options(),
-            "keep_alive": self.config.get("ollama.keep_alive", "30m"),
+            "keep_alive": self.config.get("ollama.keep_alive", "2h"),
         }
         if allow_tools and tools:
             kwargs["tools"] = self.build_tools(tools)
