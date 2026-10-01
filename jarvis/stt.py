@@ -31,6 +31,9 @@ PRIVACY_HINT = (
     "и что в настройках Джарвиса выбран нужный микрофон."
 )
 SILENCE_SECONDS = 8.0  # столько секунд абсолютных нулей — и сообщаем, что микрофон, видимо, заблокирован
+# Конец собственной фразы Джарвиса доходит до микрофона с задержкой (звуковой тракт, эхо комнаты):
+# столько секунд после его речи звук не распознаётся, иначе «…блокнот?» + «да» превращается в «нот да».
+ECHO_TAIL_SECONDS = 0.5
 _MAPPER_NAMES = ("sound mapper", "переназначение звуковых", "primary sound capture", "первичный драйвер записи")
 
 
@@ -127,6 +130,7 @@ class Listener:
         self._deadline = 0.0
         self._speech_started = 0.0
         self._command_peak = 0.0
+        self._hold_until = 0.0
         self._reset = False
         self._restart = False
         self._last_partial = ""
@@ -197,12 +201,15 @@ class Listener:
             self._reset = True
         self._wake.set()
 
-    def listen_command(self, timeout: float | None = None) -> None:
-        """Следующая фраза — команда (без слова-активатора)."""
+    def listen_command(self, timeout: float | None = None, hold: float = 0.0) -> None:
+        """Следующая фраза — команда (без слова-активатора). hold — сколько секунд пропустить сначала
+        (сразу после речи Джарвиса — его собственное эхо)."""
         if not self.available:
             return
         wait = float(timeout if timeout is not None else self.config.get("voice.listen_timeout", 7))
         with self._lock:
+            if hold > 0:
+                self._hold_until = max(self._hold_until, time.monotonic() + hold)
             self._command = True
             self._deadline = time.monotonic() + wait
             self._speech_started = 0.0
@@ -225,8 +232,11 @@ class Listener:
     def stream_open(self) -> bool:
         return self._stream is not None
 
-    def reset(self) -> None:
-        """Сбросить накопленный звук (например, после того как Джарвис договорил)."""
+    def reset(self, hold: float = 0.0) -> None:
+        """Сбросить накопленный звук (например, после того как Джарвис договорил) и, если задано
+        hold, не распознавать ещё столько секунд — пока до микрофона доходит хвост его речи."""
+        if hold > 0:
+            self._hold_until = max(self._hold_until, time.monotonic() + hold)
         self._reset = True
 
     def restart(self) -> None:
@@ -497,26 +507,31 @@ class Listener:
                 continue
             now = time.monotonic()
             if data is not None and self._recognizer is not None:
-                data = self._process_audio(data, now)
-                for tap in list(self._taps):
-                    tap.put(data)
-                try:
-                    if self._recognizer.AcceptWaveform(data):
-                        text = json.loads(self._recognizer.Result()).get("text", "").strip()
-                        self._publish_partial("")
-                        if text:
-                            self._deliver(text)
-                        else:
-                            self._wake_heard = False
-                    else:
-                        partial = json.loads(self._recognizer.PartialResult()).get("partial", "").strip()
-                        if partial and not self._speech_started:
-                            self._speech_started = now
-                        self._publish_partial(partial)
-                        self._check_partial_wake(partial)
-                except Exception as exc:
-                    log.exception("Ошибка распознавания")
-                    self.on_error(f"Ошибка распознавания речи: {exc}", "")
-                    self._reset = True
+                self._feed(data, now)
             self._check_timeouts(now)
         self._close_stream()
+
+    def _feed(self, data: bytes, now: float) -> None:
+        data = self._process_audio(data, now)
+        for tap in list(self._taps):
+            tap.put(data)
+        if now < self._hold_until:
+            return  # эхо собственной речи Джарвиса — не распознаём (уровень на экране всё равно виден)
+        try:
+            if self._recognizer.AcceptWaveform(data):
+                text = json.loads(self._recognizer.Result()).get("text", "").strip()
+                self._publish_partial("")
+                if text:
+                    self._deliver(text)
+                else:
+                    self._wake_heard = False
+            else:
+                partial = json.loads(self._recognizer.PartialResult()).get("partial", "").strip()
+                if partial and not self._speech_started:
+                    self._speech_started = now
+                self._publish_partial(partial)
+                self._check_partial_wake(partial)
+        except Exception as exc:
+            log.exception("Ошибка распознавания")
+            self.on_error(f"Ошибка распознавания речи: {exc}", "")
+            self._reset = True

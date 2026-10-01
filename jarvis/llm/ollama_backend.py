@@ -228,10 +228,12 @@ class OllamaBackend(LLMBackend):
             raise LLMError("У локальной модели нет зрения.",
                            "Скачайте модель со зрением: ollama pull qwen2.5vl:7b — и укажите её в config.yaml → "
                            "ollama.vision_model.")
+        # Отдельную модель со зрением долго в памяти не держим: рядом с основной ей может не хватить места.
+        keep_alive = self.config.get("ollama.keep_alive", "2h") if model == self.model else "5m"
         try:
             response = self.client.chat(model=model, messages=[{"role": "user", "content": prompt, "images": [image]}],
-                                        options={"temperature": 0.2, "num_ctx": int(self.config.get("ollama.num_ctx", 12288))},
-                                        keep_alive=self.config.get("ollama.keep_alive", "2h"))
+                                        options={"temperature": 0.2, "num_ctx": int(self.config.get("ollama.num_ctx", 16384))},
+                                        keep_alive=keep_alive)
         except self._ollama.ResponseError as exc:
             raise self._response_error(exc) from None
         except (ConnectionError, httpx.TransportError):

@@ -95,6 +95,7 @@ def test_voice_answers_to_suggestion():
     answer = proactive.suggestion_answer
     assert answer("да") == answer("да давай") == answer("конечно сэр") == answer("давай") == "yes"
     assert answer("нет") == answer("не сейчас") == answer("нет спасибо") == answer("не надо") == "later"
+    assert answer("нот да давай") == "yes"  # «…блокнот?» из колонок + ответ
     assert answer("сделай погромче") is None and answer("да открой браузер и включи музыку") is None
     assert answer("") is None and answer("какая погода") is None
 

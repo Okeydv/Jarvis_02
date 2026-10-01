@@ -157,6 +157,24 @@ def test_command_mode_delivers_and_stops_listening(config):
     assert events.listening == [True, False] and not listener.command_active
 
 
+def test_echo_tail_after_speech_is_not_recognized(config):
+    events = Events()
+    listener = events.listener(config)
+    listener.available = True
+    fed = []
+    listener._recognizer = types.SimpleNamespace(AcceptWaveform=lambda data: fed.append(data) or False,
+                                                 PartialResult=lambda: '{"partial": ""}')
+    listener.listen_command(5, hold=0.5)  # Джарвис только что договорил вопрос
+    start = time.monotonic()
+    listener._feed(np.full(160, 500, dtype=np.int16).tobytes(), start)  # хвост его фразы из колонок
+    assert fed == [] and listener.level > 0  # не распознаём, но уровень показываем
+    listener._feed(np.full(160, 500, dtype=np.int16).tobytes(), start + 0.6)
+    assert len(fed) == 1  # ответ пользователя — распознаём
+    listener.reset(hold=0.5)
+    listener._feed(b"\x00\x00" * 160, time.monotonic())
+    assert len(fed) == 1
+
+
 def test_command_timeout_without_speech(config):
     events = Events()
     listener = events.listener(config)

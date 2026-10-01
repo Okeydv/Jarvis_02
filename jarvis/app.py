@@ -27,7 +27,7 @@ from .memory import HistoryStore
 from .proactive import Proactive, Suggestion, suggestion_answer
 from .routines import Scheduler
 from .storage import data_folder
-from .stt import Listener, VoiceError, list_input_devices
+from .stt import ECHO_TAIL_SECONDS, Listener, VoiceError, list_input_devices
 from .text_utils import SentenceSplitter, contains_stop_word, find_wake_word, is_stop_phrase, normalize
 from .tools import Confirmation, ToolRegistry, ToolResult, ToolServices
 from .tts import Speaker, SpeechError
@@ -712,10 +712,10 @@ class JarvisApp:
     def _on_speaking(self, speaking: bool) -> None:
         self._speaking = speaking
         if not speaking and self.jarvis_mode:
-            self.listener.reset()
+            self.listener.reset(hold=ECHO_TAIL_SECONDS)
         if not speaking and self._listen_after_speech:
             self._listen_after_speech = False
-            self.listener.listen_command(float(self.config.get("voice.follow_up_seconds", 6)))
+            self.listener.listen_command(float(self.config.get("voice.follow_up_seconds", 6)), hold=ECHO_TAIL_SECONDS)
         self._refresh_state()
 
     def _on_voice_error(self, message: str, hint: str = "") -> None:

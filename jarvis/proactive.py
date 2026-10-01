@@ -2,7 +2,7 @@
 
 Heartbeat раз в несколько минут делает дешёвые локальные проверки (без обращения к модели —
 это бесплатно и не тратит лимиты): диск, батарея, память, процессор. Если что-то не так —
-карточка с вопросом «Да / Не сейчас / Не предлагать». Против спама: не больше N предложений
+карточка с вопросом «Да / Не сейчас / Больше не предлагать». Против спама: не больше N предложений
 в час, тихие часы, режим «Не беспокоить», пауза после «Не сейчас», а после трёх отказов
 подряд такие предложения затихают на неделю. Ещё — утренний брифинг и сводка «пока вас не было».
 """
@@ -127,13 +127,17 @@ _NO_WORDS = _NO_CORE | _FILLER | {"надо", "нужно", "сейчас", "п�
 def suggestion_answer(words: str) -> str | None:
     """Короткий ответ голосом на предложение: «да, давай» → yes, «нет, не сейчас» → later.
     Всё остальное («сделай погромче») — новая просьба, а не ответ."""
-    tokens = set(words.split())
-    if not tokens or len(words.split()) > 4:
+    tokens = words.split()
+    if not tokens or len(tokens) > 5:
         return None
-    if tokens <= _NO_WORDS and tokens & _NO_CORE:
-        return "later"
-    if tokens <= _YES_WORDS and tokens & _YES_CORE:
-        return "yes"
+    for start in (0, 1):  # первым словом может распознаться хвост вопроса Джарвиса из колонок: «нот да»
+        rest = set(tokens[start:])
+        if not rest:
+            break
+        if rest <= _NO_WORDS and rest & _NO_CORE:
+            return "later"
+        if rest <= _YES_WORDS and rest & _YES_CORE:
+            return "yes"
     return None
 
 

@@ -250,7 +250,7 @@ class Bubble(ctk.CTkFrame):
 
 
 class SuggestionCard(ctk.CTkFrame):
-    """Джарвис сам предлагает помощь: «Да» / «Не сейчас» / «Не предлагать»."""
+    """Джарвис сам предлагает помощь: «Да» / «Не сейчас» / «Больше не предлагать»."""
 
     def __init__(self, master, text: str, fonts: theme.Fonts, wrap: int, on_answer: Callable[[str], None]):
         super().__init__(master, fg_color=theme.NOTE_BG, corner_radius=16, border_width=1, border_color=theme.NOTE_BORDER)
@@ -261,20 +261,27 @@ class SuggestionCard(ctk.CTkFrame):
         self.label = ctk.CTkLabel(self, text=text, font=fonts.body, text_color=theme.TEXT, justify="left", anchor="w",
                                   wraplength=wrap)
         self.label.pack(fill="x", padx=14, pady=(2, 6))
+        # Две кнопки в ряд и тихая третья под ними — помещаются даже в узкий чат (экран 1024×768).
         self.buttons = ctk.CTkFrame(self, fg_color="transparent")
-        self.buttons.pack(fill="x", padx=10, pady=(0, 10))
-        for label, answer, color, hover in (("Да", "yes", theme.BLUE, theme.BLUE_HOVER),
-                                            ("Не сейчас", "later", theme.SECONDARY, theme.SECONDARY_HOVER),
-                                            ("Не предлагать", "never", theme.SECONDARY, theme.SECONDARY_HOVER)):
-            ctk.CTkButton(self.buttons, text=label, height=30, width=110 if answer != "never" else 140,
-                          corner_radius=10, font=fonts.small_bold, fg_color=color, hover_color=hover,
-                          text_color=theme.TEXT, command=lambda a=answer: self.on_answer(a)).pack(side="left", padx=4)
+        self.buttons.pack(fill="x", padx=10, pady=(0, 8))
+        self.buttons.grid_columnconfigure((0, 1), weight=1, uniform="answers")
+        for column, (label, answer, color, hover) in enumerate((("Да", "yes", theme.BLUE, theme.BLUE_HOVER),
+                                                                 ("Не сейчас", "later", theme.SECONDARY,
+                                                                  theme.SECONDARY_HOVER))):
+            ctk.CTkButton(self.buttons, text=label, height=30, width=80, corner_radius=10, font=fonts.small_bold,
+                          fg_color=color, hover_color=hover, text_color=theme.TEXT,
+                          command=lambda a=answer: self.on_answer(a)).grid(row=0, column=column, sticky="ew", padx=4)
+        ctk.CTkButton(self.buttons, text="Больше не предлагать", height=22, width=60, corner_radius=8,
+                      font=fonts.small, fg_color="transparent", hover_color=theme.SECONDARY, text_color=theme.MUTED,
+                      command=lambda: self.on_answer("never")).grid(row=1, column=0, columnspan=2, sticky="w",
+                                                                     padx=4, pady=(4, 0))
 
     def answered(self, answer: str) -> None:
         for child in self.buttons.winfo_children():
             child.destroy()
         text = {"yes": "✓ Вы согласились", "later": "Отложено", "never": "Больше не предлагаю"}.get(answer, answer)
-        ctk.CTkLabel(self.buttons, text=text, font=self.fonts.small, text_color=theme.MUTED).pack(side="left", padx=6)
+        ctk.CTkLabel(self.buttons, text=text, font=self.fonts.small, text_color=theme.MUTED).grid(row=0, column=0,
+                                                                                               sticky="w", padx=6)
 
     def set_wrap(self, wrap: int) -> None:
         self.label.configure(wraplength=wrap)
